@@ -3,7 +3,7 @@ const siteMetadata = {
   title: 'Tech Notes',
   author: 'Backend Developer',
   headerTitle: 'Tech Notes',
-  description: '실무에서 겪은 문제와 선택을 기록하는 기술 노트',
+  description: '백엔드·서버·운영 관점에서 문제를 이해하고 해결하는 과정을 기록하는 개발 블로그',
   language: 'ko',
   theme: 'system', // system, dark or light
   siteUrl: 'https://tech-notes-nu.vercel.app',
