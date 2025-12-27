@@ -1,10 +1,9 @@
 ---
-title: Vercel 배포 전에 막혔던 문제: ESLint 9와 Node.js 버전
-date: 2025-12-20
-tags:
-  - devops
-  - troubleshooting
-summary: Vercel 배포 문제로 보였지만 실제로는 git commit 단계에서 발생한 로컬 개발 환경 이슈였다.
+title: 'Vercel 배포 전에 막혔던 문제: ESLint 9와 Node.js 버전'
+date: '2025-12-20'
+draft: false
+summary: '1. 문제 상황 : 커밋이 안된다. Vercel 배포 과정에서 문제가 생긴 줄 알았지만, 실제로는 배포 이전 단계인 git commit 시점에서 작업이 막혔다. - 코드 수정 후 커밋 시도 - 커밋이 정상적으로 완료되지 않음 2. 에러 로그 분석 ESLint: 9.x ConfigError: structuredClone is not defined 왜 발생했을까? 에러 메시지의 핵심인 structuredClone은 자바스크립트의 깊은 복사를 수행하는 최신 API입니다.ESLint 9.x: 최신 업데이트를'
+tags: ['ops', 'troubleshooting']
 ---
 
 ## 1. 문제 상황 : 커밋이 안된다.
@@ -44,7 +43,8 @@ Node.js 16.x: 이 버전은 해당 API를 지원하지 않음 (Node.js 17+ 필�
 해결책은 간단했습니다. 로컬 환경의 Node.js 버전을 20 버전(LTS)으로 끌어올리는 것이었습니다.
 
 Step 1: 버전 변경 (NVM 사용)
-Bash
 
+```Bash
 nvm install 20
 nvm use 20
+```
