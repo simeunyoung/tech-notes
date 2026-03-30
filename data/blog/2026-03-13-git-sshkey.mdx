@@ -1,0 +1,176 @@
+---
+title: '운영 서버 Git SSH Key 인증 설정 및 배포 자동화'
+date: '2026-03-13'
+draft: false
+summary: '기존 HTTPS + 토큰 방식에서 SSH Key 방식으로 전환하고, 배포 스크립트로 자동화까지 연결한 과정을 정리한다.'
+tags: ['devops', 'server', 'git']
+---
+
+## 배경
+
+기존 운영 서버에서 Git 저장소에 접근할 때 HTTPS 방식을 사용하고 있었다.
+`git pull` 할 때마다 username과 token을 직접 입력하거나 URL에 포함시키는 방식이었는데,
+배포 자동화를 위한 쉘 스크립트를 만들면서 이 방식으로는 한계가 있었다.
+
+그래서 SSH Key 방식으로 전환을 건의 드리고 진행하게 되었다.
+
+---
+
+## SSH Key 방식이란
+
+SSH 방식은 서버에 **키 쌍**을 생성한 뒤,
+
+- **개인키(private key)** 는 서버에 보관
+- **공개키(public key)** 는 GitHub에 등록
+
+하는 구조다.
+이후 Git remote URL을 HTTPS 대신 SSH 주소로 바꾸면 인증 없이 `git pull`, `git clone`, `git push`가 가능하다.
+
+---
+
+## 우리 환경 기준 운영 방식
+
+SSH Key는 **계정 단위가 아니라 서버 단위로 생성**했다.
+각 서버가 접근이 필요한 저장소에만 키를 등록하는 방식으로 권한을 최소화했다.
+
+예를 들어 서버가 3대 있을 때,
+
+- **서버 A** → A 서비스 저장소에만 SSH Key 등록
+- **서버 B** → B 서비스 저장소에만 SSH Key 등록
+- **서버 C** → C, D, E 서비스 저장소에 동일 키 등록
+
+서버마다 키를 따로 만들고, 그 서버가 접근할 저장소에만 등록하는 것이 기본 원칙이다.
+
+---
+
+## 설정 순서
+
+### 1. SSH Key 생성
+
+서버에서 아래 명령을 실행한다.
+
+```bash
+ssh-keygen -t ed25519 -C "server-name"
+```
+
+- `-t ed25519` : 키 알고리즘 타입
+- `-C "server-name"` : 키를 식별하기 위한 코멘트. **서버명으로 작성하는 것을 권장**한다.
+
+생성하면 기본 경로에 두 파일이 만들어진다.
+
+```
+~/.ssh/id_ed25519       # 개인키 (서버에 보관)
+~/.ssh/id_ed25519.pub   # 공개키 (GitHub에 등록)
+```
+
+---
+
+### 2. 공개키 확인
+
+```bash
+cat ~/.ssh/id_ed25519.pub
+```
+
+출력된 전체 문자열을 복사해 둔다.
+
+```
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA.... server-name
+```
+
+---
+
+### 3. GitHub에 공개키 등록
+
+GitHub 해당 저장소 또는 계정의 SSH Keys 설정 화면에서 등록한다.
+
+- **Title** : 서버 식별용 이름 (서버명으로 통일)
+- **Key** : `id_ed25519.pub` 내용 전체 붙여넣기
+
+> 주의: `ssh-keygen -C` 뒤의 코멘트와 GitHub Title은 보통 서버명으로 맞춰두면 나중에 관리가 편하다.
+
+---
+
+### 4. SSH 연결 테스트
+
+```bash
+ssh -T git@github.com
+```
+
+아래와 같은 메시지가 뜨면 정상이다.
+
+```
+Hi <계정명>! You've successfully authenticated, but GitHub does not provide shell access.
+```
+
+---
+
+### 5. Git remote URL을 SSH로 변경
+
+현재 remote 확인
+
+```bash
+git remote -v
+```
+
+기존이 HTTPS 방식이면 아래처럼 나온다.
+
+```
+origin  https://github.com/org-name/repo-name.git
+```
+
+SSH 방식으로 변경
+
+```bash
+git remote set-url origin git@github.com:org-name/repo-name.git
+```
+
+변경 후 확인
+
+```bash
+git remote -v
+# origin  git@github.com:org-name/repo-name.git
+```
+
+---
+
+### 6. 동작 확인
+
+이후부터는 username, token 입력 없이 그냥 사용 가능하다.
+
+```bash
+git pull origin main
+```
+
+---
+
+## 배포 스크립트 연결
+
+SSH Key 설정 이후, 배포를 수동으로 하기 번거로워서 쉘 스크립트로 자동화했다.
+스크립트는 아래 순서로 동작한다.
+
+1. 서비스 중지 (`systemctl stop`)
+2. 소스 디렉토리로 이동
+3. `git pull` 로 최신 코드 반영
+4. Gradle 빌드 (`-x test` 옵션으로 테스트 제외)
+5. 기존 JAR 백업 (날짜+시간 suffix로 파일명 구분)
+6. 새 JAR 파일 운영 경로로 복사
+7. 파일 소유자 및 권한 설정
+8. 서비스 시작 (`systemctl start`)
+9. 서비스 상태 출력으로 배포 결과 확인
+
+각 단계에서 실패 시 `exit 1`로 즉시 중단하도록 처리했고,
+서비스 중지 단계는 이미 내려가 있어도 계속 진행되도록 `|| true`를 붙였다.
+
+---
+
+## 정리
+
+| 항목        | 변경 전                  | 변경 후            |
+| ----------- | ------------------------ | ------------------ |
+| 인증 방식   | HTTPS + username + token | SSH Key            |
+| git pull 시 | 매번 자격증명 필요       | 자격증명 불필요    |
+| 배포        | 수동                     | 쉘 스크립트 자동화 |
+| 보안        | 토큰 노출 위험           | 키 파일 서버 보관  |
+
+SSH Key 방식으로 전환하니 배포 자동화가 훨씬 깔끔해졌다.
+서버별로 키를 분리해두니 특정 서버 키가 노출되더라도 영향 범위를 최소화할 수 있다는 점도 장점이다.

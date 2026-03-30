@@ -1,0 +1,213 @@
+---
+title: 'nohup 대신 systemd로 서비스 관리 방식 전환하기'
+date: '2026-03-12'
+draft: false
+summary: '기존 nohup 방식으로 운영 중이던 서버를 systemd로 전환한 과정과 두 방식의 차이를 정리한다.'
+tags: ['server', 'infra']
+---
+
+## 배경
+
+기존 운영 서버는 애플리케이션을 `nohup`으로 실행하고 있었다.
+서버를 직접 들여다보다 보니 프로세스 상태 확인도 번거롭고,
+서버 재부팅 시 서비스가 자동으로 올라오지 않는 문제가 있었다.
+
+OS가 직접 서비스를 관리하는 `systemd` 방식이 운영 환경에 더 적합하다고 판단해서,
+팀장님께 건의 후 전환 작업을 진행했다.
+
+---
+
+## nohup이란
+
+`nohup`은 터미널 세션이 종료되어도 프로세스가 죽지 않도록 실행하는 명령어다.
+SSH 세션이 끊겨도 프로그램이 계속 돌아가게 해준다.
+
+```bash
+nohup java -jar app.jar &
+```
+
+- `nohup` → 터미널 종료 시에도 프로세스 유지
+- `&` → 백그라운드 실행
+
+실행 구조는 아래와 같다.
+
+```
+shell
+ └─ nohup
+      └─ java
+```
+
+프로세스를 관리하려면 PID 파일을 직접 만들어두고 kill 명령으로 종료해야 한다.
+
+```bash
+# 실행
+nohup java -jar app.jar &
+echo $! > app.pid
+
+# 상태 확인
+ps -ef | grep java
+
+# 종료
+kill $(cat app.pid)
+```
+
+간단하게 쓸 수 있다는 장점이 있지만, 운영 환경에서는 관리 측면에서 한계가 있다.
+
+### nohup의 단점
+
+- 프로세스 상태 관리가 어렵다
+- 자동 재시작이 없다
+- 서버 reboot 시 자동 실행되지 않는다
+- 로그 관리를 직접 해야 한다
+- graceful shutdown 보장이 어렵다
+
+---
+
+## systemd란
+
+`systemd`는 Linux의 서비스 관리 시스템이다.
+OS가 직접 프로세스를 관리한다.
+
+```
+systemd
+ └─ java
+```
+
+서비스는 아래 경로에 파일로 정의한다.
+
+```
+/etc/systemd/system/서비스명.service
+```
+
+### service 파일 작성 예시
+
+```ini
+[Unit]
+Description=App Spring Boot Service
+After=network.target
+
+[Service]
+User=app-user
+WorkingDirectory=/app/server
+ExecStart=/usr/bin/java -jar /app/server/app.jar --spring.profiles.active=prod
+Restart=always
+RestartSec=5
+SuccessExitStatus=143
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### 주요 항목 설명
+
+| 항목               | 의미                         |
+| ------------------ | ---------------------------- |
+| `Description`      | 서비스 설명                  |
+| `After`            | 어떤 서비스 이후 실행할지    |
+| `User`             | 실행 사용자                  |
+| `WorkingDirectory` | 실행 디렉토리                |
+| `ExecStart`        | 서비스 실행 명령             |
+| `Restart`          | 프로세스 종료 시 재시작 여부 |
+| `RestartSec`       | 재시작 대기 시간             |
+| `WantedBy`         | 부팅 시 자동 실행 대상       |
+
+### 주요 명령어
+
+```bash
+# 시작
+systemctl start app-service
+
+# 종료
+systemctl stop app-service
+
+# 재시작
+systemctl restart app-service
+
+# 상태 확인
+systemctl status app-service
+
+# 서버 부팅 시 자동 실행 등록
+systemctl enable app-service
+
+# 로그 확인
+journalctl -u app-service
+```
+
+---
+
+## SIGTERM vs SIGKILL
+
+systemd로 서비스를 종료하면 기본적으로 `SIGTERM` 시그널을 보낸다.
+
+| 시그널    | 의미           |
+| --------- | -------------- |
+| `SIGTERM` | 정상 종료 요청 |
+| `SIGKILL` | 강제 종료      |
+
+### SIGTERM — graceful shutdown
+
+```bash
+kill PID
+# 또는
+systemctl stop 서비스명
+```
+
+프로그램에게 "정상적으로 종료해라"고 요청하는 것이다.
+Spring Boot에서는 아래 순서로 종료가 진행된다.
+
+```
+SIGTERM 수신
+ → 새 요청 차단
+ → 현재 처리 중인 요청 완료 대기
+ → DB connection 정리
+ → Spring context 종료
+ → JVM 종료
+```
+
+이것을 **graceful shutdown**이라고 한다.
+
+### SIGKILL — 강제 종료
+
+```bash
+kill -9 PID
+```
+
+프로세스를 즉시 죽이기 때문에 아래 문제가 생길 수 있다.
+
+- 처리 중이던 요청이 중단됨
+- 로그 flush가 안됨
+- connection pool 정리가 안됨
+- JVM shutdown hook이 실행되지 않음
+
+운영 환경에서는 가능하면 사용하지 않는 것이 원칙이다.
+
+---
+
+## nohup vs systemd 비교
+
+| 항목                  | nohup      | systemd            |
+| --------------------- | ---------- | ------------------ |
+| 실행 방식             | shell 실행 | OS 서비스          |
+| 프로세스 관리         | 직접 관리  | systemd 관리       |
+| 상태 확인             | `ps` 명령  | `systemctl status` |
+| 종료                  | `kill`     | `systemctl stop`   |
+| 자동 재시작           | ❌         | ✅                 |
+| 서버 reboot 자동 실행 | ❌         | ✅                 |
+| graceful shutdown     | 직접 처리  | 기본 지원          |
+| 운영 환경 적합성      | 낮음       | 높음               |
+
+---
+
+## 정리
+
+`nohup`은 빠르게 프로세스를 띄울 때는 간편하지만,
+운영 서버에서 서비스를 안정적으로 관리하기에는 부족한 점이 많다.
+
+`systemd`로 전환하고 나서 아래 점이 확실히 개선됐다.
+
+- 서버 재부팅 후 서비스가 자동으로 올라옴
+- `systemctl status`로 상태 확인이 간단해짐
+- `journalctl`로 로그를 한 곳에서 볼 수 있음
+- graceful shutdown이 기본 보장됨
+
+운영 서버에서 프로세스를 띄울 때는 처음부터 systemd로 관리하는 것을 권장한다.
