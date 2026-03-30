@@ -28,12 +28,16 @@ const MobileNav = () => {
 
   return (
     <>
-      <button aria-label="Toggle Menu" onClick={onToggleNav} className="sm:hidden">
+      <button
+        aria-label="Toggle Menu"
+        onClick={onToggleNav}
+        className="flex h-8 w-8 items-center justify-center rounded-lg text-gray-600 transition-colors hover:bg-gray-100 sm:hidden dark:text-gray-400 dark:hover:bg-white/10"
+      >
         <svg
           xmlns="http://www.w3.org/2000/svg"
           viewBox="0 0 20 20"
           fill="currentColor"
-          className="hover:text-primary-500 dark:hover:text-primary-400 h-8 w-8 text-gray-900 dark:text-gray-100"
+          className="h-5 w-5"
         >
           <path
             fillRule="evenodd"
@@ -67,36 +71,42 @@ const MobileNav = () => {
             leaveTo="translate-x-full opacity-0"
             unmount={false}
           >
-            <DialogPanel className="fixed top-0 left-0 z-70 h-full w-full bg-white/95 duration-300 dark:bg-gray-950/98">
-              <nav
-                ref={navRef}
-                className="mt-8 flex h-full basis-0 flex-col items-start overflow-y-auto pt-2 pl-12 text-left"
-              >
+            <DialogPanel className="fixed top-0 left-0 z-70 h-full w-full bg-white/95 backdrop-blur-xl dark:bg-gray-950/95">
+              <div className="flex h-12 items-center justify-between border-b border-gray-200/60 px-4 dark:border-white/10">
+                <span className="text-base font-semibold text-gray-900 dark:text-gray-100">
+                  메뉴
+                </span>
+                <button
+                  className="flex h-8 w-8 items-center justify-center rounded-lg text-gray-600 transition-colors hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-white/10"
+                  aria-label="Toggle Menu"
+                  onClick={onToggleNav}
+                >
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox="0 0 20 20"
+                    fill="currentColor"
+                    className="h-5 w-5"
+                  >
+                    <path
+                      fillRule="evenodd"
+                      d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z"
+                      clipRule="evenodd"
+                    />
+                  </svg>
+                </button>
+              </div>
+              <nav ref={navRef} className="flex flex-col overflow-y-auto p-4">
                 {headerNavLinks.map((link) => (
                   <Link
                     key={link.title}
                     href={link.href}
-                    className="hover:text-primary-500 dark:hover:text-primary-400 mb-4 py-2 pr-4 text-2xl font-bold tracking-widest text-gray-900 outline outline-0 dark:text-gray-100"
+                    className="rounded-xl px-4 py-3 text-lg font-semibold text-gray-900 transition-colors hover:bg-gray-100 dark:text-gray-100 dark:hover:bg-white/10"
                     onClick={onToggleNav}
                   >
                     {link.title}
                   </Link>
                 ))}
               </nav>
-
-              <button
-                className="hover:text-primary-500 dark:hover:text-primary-400 fixed top-7 right-4 z-80 h-16 w-16 p-4 text-gray-900 dark:text-gray-100"
-                aria-label="Toggle Menu"
-                onClick={onToggleNav}
-              >
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
-                  <path
-                    fillRule="evenodd"
-                    d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z"
-                    clipRule="evenodd"
-                  />
-                </svg>
-              </button>
             </DialogPanel>
           </TransitionChild>
         </Dialog>

@@ -23,7 +23,7 @@ const siteMetadata = {
   bluesky: '',
   locale: 'ko-KR',
   // set to true if you want a navbar fixed to the top
-  stickyNav: false,
+  stickyNav: true,
   analytics: {},
   newsletter: {
     // supports mailchimp, buttondown, convertkit, klaviyo, revue, emailoctopus, beehive

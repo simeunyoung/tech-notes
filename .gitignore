@@ -45,3 +45,16 @@ yarn-error.log*
 
 # Contentlayer
 .contentlayer
+
+# Claude
+.claude/
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Editor
+.idea/
+*.swp
+*.swo
+package-lock.json
