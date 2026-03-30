@@ -1,0 +1,75 @@
+---
+title: 'alias로 SSH 접속 스크립트 단축 명령어 등록하기'
+date: '2026-03-11'
+draft: false
+summary: '매번 ./ssh.sh를 입력하는 대신 alias를 등록해 짧은 명령어로 SSH 접속 스크립트를 실행하는 방법을 정리한다.'
+tags: ['server', 'devops']
+---
+
+## 배경
+
+서버에 SSH로 접속할 때 쓰는 스크립트가 있는데,
+매번 `./ssh.sh`를 직접 입력하는 게 번거로워서 alias로 등록해 단축했다.
+
+---
+
+## alias 등록
+
+`~/.bashrc`에 아래 한 줄을 추가한다.
+
+```bash
+alias list='/home/ec2-user/ssh.sh'
+```
+
+---
+
+## ~/.bashrc란
+
+`~/.bashrc`는 bash 셸이 시작될 때 자동으로 실행되는 설정 파일이다.
+alias, 환경변수, 함수 등 셸 환경 설정을 여기에 등록해두면 로그인할 때마다 자동으로 적용된다.
+`~/.bash_profile`이나 `~/.profile`도 비슷한 역할을 하지만,
+대화형 셸(interactive shell) 기준으로는 `~/.bashrc`가 일반적으로 쓰인다.
+
+---
+
+## 적용
+
+```bash
+source ~/.bashrc
+```
+
+또는 새로 SSH 로그인하면 자동 적용된다.
+
+---
+
+## 확인
+
+```bash
+type list
+# list is aliased to `/home/ec2-user/ssh.sh`
+```
+
+---
+
+## 실행
+
+```bash
+list
+```
+
+```
+host.list 읽기
+ → 서버 목록 출력
+ → 번호 선택
+ → SSH 접속
+```
+
+---
+
+## 관련 파일
+
+| 파일                       | 설명              |
+| -------------------------- | ----------------- |
+| `/home/ec2-user/ssh.sh`    | SSH 접속 스크립트 |
+| `/home/ec2-user/host.list` | 접속 서버 목록    |
+| `~/.bashrc`                | alias 설정 파일   |

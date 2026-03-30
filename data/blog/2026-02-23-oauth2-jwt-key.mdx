@@ -1,0 +1,160 @@
+---
+title: 'OAuth2.0 Authorization Server — JWT Key 관리 개선기'
+date: '2026-02-23'
+draft: false
+summary: '서버 재시작마다 JWT 키가 새로 생성되는 구조의 문제점을 파악하고, DB 기반 고정 키 방식으로 개선한 과정을 정리한다.'
+tags: ['spring-boot', 'backend', 'troubleshooting']
+---
+
+## 배경
+
+OAuth2.0 Authorization Server를 운영하면서 JWT 키 관리 방식에 문제가 있다는 걸 파악했다.
+기존 구조를 분석하고 개선하는 과정을 정리한다.
+
+---
+
+## 기존 구조 — 서버 시작 시 키 자동 생성
+
+기존에는 서버가 시작될 때마다 JWT private key를 자동으로 생성해서 사용하고 있었다.
+
+이 상태에서 서버가 이중화(2대)되어 있으면 두 서버는 **서로 다른 키**를 갖게 된다.
+
+```
+서버 A 시작 → key-A 생성
+서버 B 시작 → key-B 생성
+
+서버 A가 발급한 토큰 → 서버 B에서 검증 실패 ❌
+```
+
+### 왜 당장 문제가 없었나
+
+ALB의 **Sticky Session** 기능을 사용하고 있었기 때문이다.
+한 번 A 서버에 붙은 사용자는 계속 A 서버로만 요청이 가서,
+키가 달라도 같은 서버 안에서만 검증이 이루어지므로 문제가 드러나지 않았다.
+
+### 언제 문제가 터지나
+
+**무중단 배포** 시 문제가 발생한다.
+
+```
+1. 서버 A 재시작 → 새 key-A' 생성
+   → 기존 서버 A 사용자 전원 로그아웃 ❌
+
+2. 서버 B 재시작 → 새 key-B' 생성
+   → 기존 서버 B 사용자 전원 로그아웃 ❌
+```
+
+배포할 때마다 모든 사용자가 강제 로그아웃되는 구조였다.
+
+---
+
+## 해결 — DB 기반 고정 키 (jwk_settings 테이블)
+
+JWT 키를 서버 시작 시 생성하지 않고,
+DB의 `jwk_settings` 테이블에서 불러오는 방식으로 변경했다.
+
+키가 DB에 고정되어 있으므로 서버를 재시작하거나 이중화해도 항상 같은 키를 사용한다.
+
+### 동작 방식
+
+서버 부팅 시 `JwkService`가 아래 순서로 동작한다.
+
+```
+서버 시작
+ └─ JwkService 실행
+      ├─ jwk_settings 테이블에 키가 있는지 확인
+      ├─ 있으면 → DB에서 RSA 키 로드
+      └─ 없으면 → RSA 2048-bit 키 신규 생성 후 DB 저장
+ └─ JWKSource 빈으로 노출 → JWT 서명/검증에 사용
+```
+
+### 이 방식의 핵심
+
+- 키가 DB에 저장되므로 **서버 재시작해도 같은 키 유지**
+- 이중화 환경에서 모든 서버가 **같은 DB를 바라보므로 동일한 키 사용**
+- 최초 1회만 키가 생성되고 이후에는 계속 재사용
+
+```
+서버 A 시작 → jwk_settings에서 키 로드 → key-X 사용
+서버 B 시작 → jwk_settings에서 키 로드 → key-X 사용 (동일)
+
+서버 A가 발급한 토큰 → 서버 B에서 검증 성공 ✅
+```
+
+---
+
+## Authorization Server 리팩토링
+
+JWT Key 관리 개선과 함께 Authorization Server 구조도 함께 정리했다.
+
+### SecurityFilterChain 역할 분리
+
+기존에는 app 체인에서 `/oauth2/**`를 `permitAll`로 열어두고 있었는데,
+이 방식은 `/oauth2/token`, `/oauth2/jwks` 같은 핵심 엔드포인트가
+의도치 않게 공개될 위험이 있다.
+
+두 체인의 역할을 명확히 분리했다.
+
+| 체인                      | 순서    | 담당                           |
+| ------------------------- | ------- | ------------------------------ |
+| Authorization Server 체인 | Order 1 | `/oauth2/**`, OIDC UserInfo 등 |
+| App 체인                  | Order 2 | 로그인 페이지, 일반 API 보호   |
+
+app 체인에서 `/oauth2/**` permitAll을 완전히 제거하고,
+Authorization Server 체인이 전담하도록 정리했다.
+
+### UserInfo 엔드포인트 정리
+
+기존에 커스텀 컨트롤러로 `/oauth2/userinfo`를 직접 구현하고 있었는데,
+Spring Authorization Server의 OIDC 표준 UserInfo 엔드포인트로 전환했다.
+
+사용자 정보는 토큰 발급 시점에 `OAuth2TokenCustomizer`로 claims를 주입하는 방식으로 통일했다.
+
+```java
+// 토큰에 커스텀 클레임 주입 예시
+context.getClaims().claim("user_id", user.getId());
+context.getClaims().claim("group_id", user.getGroupId());
+```
+
+### Logout 정리
+
+JWT 기반 구조에서 logout의 의미를 명확히 했다.
+
+JWT는 서버가 상태를 저장하지 않으면 만료 전까지 유효하므로,
+`/logout` 호출만으로는 JWT 자체가 무효화되지 않는다.
+
+진짜 로그아웃(재발급 차단)이 필요하다면 Authorization Server에서 Refresh Token을 DB에 저장하고,
+logout 시 해당 토큰을 폐기하는 방식으로 처리해야 한다.
+
+### PKCE 활성화
+
+모바일/WebView 환경에서 PKCE가 비활성화되어 있어 Authorization Code 탈취 공격에 취약한 상태였다.
+PKCE를 활성화해 보안을 강화했다.
+
+```
+클라이언트가 /oauth2/authorize 요청 시 필요한 값:
+- code_challenge
+- code_challenge_method=S256
+```
+
+---
+
+## 개선 전후 비교
+
+| 항목             | 개선 전                 | 개선 후                                          |
+| ---------------- | ----------------------- | ------------------------------------------------ |
+| JWT 키 생성      | 서버 시작마다 새로 생성 | DB(`jwk_settings`)에서 로드, 없으면 생성 후 저장 |
+| 이중화 환경      | 서버마다 다른 키        | 모든 서버가 같은 DB 키 공유                      |
+| 배포 시 로그아웃 | 전원 강제 로그아웃      | 토큰 유지                                        |
+| UserInfo         | 커스텀 컨트롤러         | OIDC 표준 엔드포인트                             |
+| PKCE             | 비활성화                | 활성화                                           |
+
+---
+
+## 정리
+
+기존 구조는 Sticky Session 덕분에 당장 문제가 드러나지 않았지만,
+무중단 배포가 필요한 시점에 반드시 터질 수밖에 없는 구조였다.
+
+KeyStore 기반으로 키를 고정하고 나서 배포 시 사용자 로그아웃 문제가 해소됐고,
+Authorization Server 구조도 Spring 표준에 맞게 정리됐다.
