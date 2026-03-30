@@ -1,0 +1,333 @@
+---
+title: 'Spring ApplicationEvent로 이벤트 로직 분리하기'
+date: '2026-02-08'
+draft: false
+summary: '디바이스 제어 실행 시 여러 후속 작업이 한 메서드에 뭉쳐있던 구조를 Spring ApplicationEvent 기반 비동기 처리로 분리한 과정을 정리한다.'
+tags: ['spring-boot', 'backend']
+---
+
+## 배경
+
+스마트 홈 디바이스 자동화 서버는 디바이스 제어를 세 가지 방식으로 처리한다.
+
+- **수동 제어** — 버튼 하나로 여러 디바이스 동시 제어
+- **예약 제어** — 시간 기반 자동 제어 (Quartz 스케줄러)
+- **조건부 제어** — 디바이스 A 상태 변화 시 디바이스 B 자동 제어
+
+세 방식 모두 제어 실행 시 공통으로 처리해야 하는 후속 작업이 있다.
+
+1. 디바이스 제어 API 호출 — 실제 디바이스에 제어 명령 전송
+2. FCM 푸시 알림 — 사용자 모바일에 알림 발송
+3. 이력 저장 — 실행 이력 DB 기록
+
+기존에는 이 세 작업이 하나의 서비스 메서드 안에 순차적으로 뭉쳐있었다.
+
+---
+
+## 기존 구조의 문제
+
+```
+ActionExecuteService.execute()
+  → 디바이스 제어 API 호출  (동기)
+  → FCM 푸시 알림           (동기)
+  → 이력 저장               (동기)
+```
+
+문제는 두 가지였다.
+
+**1. 성능**
+세 작업이 순차 실행되므로 전체 응답 시간이 각 작업의 합이 된다.
+FCM 알림이 느리면 제어 완료 응답도 늦어진다.
+
+**2. 강한 결합**
+제어 호출 로직, 알림 로직, 이력 저장 로직이 하나의 메서드에 섞여 있어서
+한 부분을 수정하면 다른 부분에 영향을 줄 수 있는 구조였다.
+
+---
+
+## 개선 — Spring ApplicationEvent 기반 분리
+
+`ApplicationEventPublisher`를 사용해 이벤트를 발행하고,
+각 리스너가 독립적으로 비동기 처리하는 구조로 변경했다.
+
+### 전체 흐름
+
+```
+ActionExecuteService.execute()
+  → ApplicationEventPublisher.publishEvent(ActionEvent)
+      ├─ DeviceControlEventListener  → 디바이스 제어 API 호출  (비동기)
+      ├─ NotificationEventListener   → FCM 푸시 알림           (비동기)
+      └─ HistoryEventListener        → 이력 저장               (비동기)
+```
+
+`execute()`는 이벤트를 발행하는 것만 담당하고,
+실제 처리는 각 리스너가 비동기로 가져가서 처리한다.
+
+### 단일 진입점 구조
+
+모든 제어 방식이 최종적으로 `ActionExecuteService.execute()` 하나를 통해 처리된다.
+
+```
+수동 제어 API      ─┐
+예약 제어 Job      ─┼→ ActionExecuteService.execute() → 이벤트 발행
+조건부 제어 API    ─┘
+```
+
+제어 방식이 달라도 이벤트 발행 이후 흐름은 동일하다.
+
+### 이벤트 클래스
+
+```java
+public class ActionEvent {
+    private final List<ActionDto> actions;
+    private final String groupId;
+    private final String userId;
+    // ...
+}
+```
+
+### 이벤트 발행
+
+```java
+@Service
+public class ActionExecuteService {
+
+    private final ApplicationEventPublisher eventPublisher;
+
+    public void execute(ActionRequest request) {
+        // 비즈니스 로직 처리
+        ActionEvent event = new ActionEvent(actions, groupId, userId);
+        eventPublisher.publishEvent(event);
+    }
+}
+```
+
+### 리스너 — 디바이스 제어 API 호출
+
+```java
+@Component
+public class DeviceControlEventListener {
+
+    @Async
+    @EventListener
+    public void handle(ActionEvent event) {
+        // 디바이스 제어 서버 API 호출
+    }
+}
+```
+
+### 리스너 — FCM 푸시 알림
+
+```java
+@Component
+public class NotificationEventListener {
+
+    @Async
+    @EventListener
+    public void handle(ActionEvent event) {
+        // FCM 서비스 호출 — 모바일 푸시 알림
+    }
+}
+```
+
+### 리스너 — 이력 저장
+
+```java
+@Component
+public class HistoryEventListener {
+
+    @Async
+    @EventListener
+    public void handle(ActionEvent event) {
+        // 실행 이력 DB 저장
+    }
+}
+```
+
+---
+
+## 비동기 Thread Pool 설정
+
+리스너가 `@Async`로 실행되므로 Thread Pool 설정이 필요하다.
+
+```java
+@Configuration
+@EnableAsync
+public class AsyncConfig implements AsyncConfigurer {
+
+    @Override
+    public Executor getAsyncExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(8);
+        executor.setMaxPoolSize(32);
+        executor.setQueueCapacity(100);
+        executor.setThreadNamePrefix("async-event-");
+        executor.initialize();
+        return executor;
+    }
+}
+```
+
+---
+
+## MDC 컨텍스트 전파
+
+비동기 처리의 흔한 문제 중 하나가 **MDC(Trace ID)가 자식 스레드로 전파되지 않는 것**이다.
+`@Async`로 넘어가면 새 스레드에서 실행되므로 MDC가 끊긴다.
+
+이를 해결하기 위해 MDC 컨텍스트를 복사해 전파하도록 처리했다.
+
+```java
+public class MdcTaskDecorator implements TaskDecorator {
+
+    @Override
+    public Runnable decorate(Runnable runnable) {
+        Map<String, String> contextMap = MDC.getCopyOfContextMap();
+        return () -> {
+            try {
+                if (contextMap != null) {
+                    MDC.setContextMap(contextMap);
+                }
+                runnable.run();
+            } finally {
+                MDC.clear();
+            }
+        };
+    }
+}
+```
+
+```java
+// AsyncConfig에 등록
+executor.setTaskDecorator(new MdcTaskDecorator());
+```
+
+이렇게 하면 비동기 리스너에서도 동일한 Trace ID로 로그가 남아
+요청 단위로 로그를 추적할 수 있다.
+
+---
+
+## 개선 전후 비교
+
+| 항목      | 개선 전                      | 개선 후                     |
+| --------- | ---------------------------- | --------------------------- |
+| 구조      | 단일 메서드 순차 처리        | 이벤트 발행 + 리스너 분리   |
+| 처리 방식 | 동기                         | 비동기                      |
+| 결합도    | 높음 (한 메서드에 혼재)      | 낮음 (리스너 독립)          |
+| 응답 속도 | 모든 후속 처리 완료까지 대기 | 이벤트 발행 후 즉시 반환    |
+| 로그 추적 | 단순                         | MDC 전파로 비동기 추적 가능 |
+| 기능 추가 | execute() 수정 필요          | 리스너 추가만으로 확장      |
+
+---
+
+## 주의사항
+
+### 1. 트랜잭션이 분리된다
+
+가장 중요한 부분이다.
+
+```
+execute() → DB 저장 (트랜잭션 A)
+  → HistoryEventListener → DB 저장 (트랜잭션 B, 별도)
+```
+
+`execute()`가 롤백돼도 이미 비동기로 넘어간 리스너는 롤백이 안 된다.
+반대로 리스너가 실패해도 `execute()`는 이미 커밋된 상태다.
+트랜잭션 경계를 명확히 인식하고 설계해야 한다.
+
+또한 `@EventListener`는 트랜잭션 커밋 전에도 이벤트가 발행될 수 있어서,
+**DB에 데이터가 저장되기 전에 리스너가 실행되는 문제**가 생길 수 있다.
+
+### 2. 예외 처리를 각 리스너에서 해야 한다
+
+비동기로 분리되면 리스너에서 예외가 터져도 `execute()`에서는 알 수 없다.
+각 리스너 안에서 try-catch로 처리하지 않으면 로그도 안 남고 조용히 실패한다.
+
+```java
+@Async
+@EventListener
+public void handle(ActionEvent event) {
+    try {
+        // 처리
+    } catch (Exception e) {
+        log.error("처리 실패: ", e);
+    }
+}
+```
+
+### 3. Thread Pool이 꽉 찰 수 있다
+
+요청이 갑자기 몰리면 Queue → MaxPoolSize 초과 → 요청 거절이 발생할 수 있다.
+`RejectedExecutionHandler`를 설정해두는 것이 좋다.
+
+### 4. 순서 보장이 안 된다
+
+리스너가 어떤 순서로 실행될지 보장이 없다.
+순서가 중요한 로직이라면 이벤트 기반이 아닌 다른 방식을 고려해야 한다.
+
+---
+
+## @TransactionalEventListener 적용
+
+위 주의사항 중 트랜잭션 문제를 해결하기 위해
+`@EventListener` 대신 `@TransactionalEventListener`를 사용했다.
+
+```java
+@TransactionalEventListener(
+    phase = TransactionPhase.AFTER_COMMIT,
+    fallbackExecution = true
+)
+@Async
+public void handle(ActionEvent event) {
+    // 트랜잭션 커밋 이후에 실행됨
+}
+```
+
+### phase = AFTER_COMMIT
+
+트랜잭션이 **커밋된 이후에만** 리스너가 실행된다.
+
+```
+execute() 트랜잭션 시작
+  → DB 저장
+  → 이벤트 발행 (아직 리스너 실행 안 됨)
+  → 트랜잭션 커밋 완료
+    → 리스너 실행 ✅
+```
+
+덕분에 DB에 데이터가 확실히 저장된 이후에 후속 처리가 실행된다.
+`execute()`가 롤백되면 리스너도 실행되지 않는다.
+
+### fallbackExecution = true
+
+트랜잭션이 없는 컨텍스트에서 이벤트가 발행된 경우에도 리스너를 실행한다.
+
+`fallbackExecution = false`(기본값)이면 트랜잭션이 없을 때 이벤트가 그냥 무시된다.
+예약 제어처럼 Quartz Job에서 이벤트를 발행하는 경우 트랜잭션이 없을 수 있어서,
+`fallbackExecution = true`로 설정해 이런 경우에도 리스너가 동작하도록 했다.
+
+```
+트랜잭션 있는 경우  → AFTER_COMMIT 이후 실행
+트랜잭션 없는 경우  → fallbackExecution = true → 즉시 실행
+```
+
+### @EventListener와 비교
+
+| 항목             | @EventListener   | @TransactionalEventListener          |
+| ---------------- | ---------------- | ------------------------------------ |
+| 실행 시점        | 이벤트 발행 즉시 | 트랜잭션 커밋 이후                   |
+| 트랜잭션 없을 때 | 즉시 실행        | 기본적으로 무시 (fallback 설정 가능) |
+| DB 정합성        | 보장 어려움      | 커밋 후 실행이므로 보장됨            |
+
+---
+
+## 정리
+
+기존 구조는 기능이 하나씩 추가될 때마다 `execute()` 메서드가 계속 커지는 구조였다.
+
+Spring ApplicationEvent를 사용하면 `execute()`는 이벤트 발행만 담당하고,
+새로운 처리가 필요할 때 리스너를 추가하기만 하면 된다.
+`execute()` 코드를 건드리지 않아도 되므로 기존 동작에 영향을 주지 않고 확장할 수 있다.
+
+MDC 전파까지 처리해두면 비동기 환경에서도 요청 단위로 로그를 추적할 수 있어서
+운영 시 문제 원인을 찾기가 훨씬 수월하다.
