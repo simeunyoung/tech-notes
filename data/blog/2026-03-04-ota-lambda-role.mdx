@@ -1,0 +1,142 @@
+---
+title: 'OTA Lambda 역할 분리 — 단일 함수에서 책임 기반 구조로'
+date: '2026-03-04'
+draft: false
+summary: 'Job 관리와 상태 업데이트가 한 Lambda에 혼재하던 구조를 역할 기준으로 두 함수로 분리하고, OTA 진행 중 신규 디바이스 누락 케이스를 선제적으로 방어한 과정을 정리한다.'
+tags: ['infra', 'devops']
+---
+
+## 배경
+
+이전 글에서 OTA 상태 반영 지연 문제를 폴링에서 이벤트 드리븐으로 전환해 해결했다.
+그 과정에서 기존 Lambda 구조 전체를 재검토하게 됐는데,
+한 함수 안에 Job 관리와 상태 업데이트가 혼재해 있었고
+OTA 진행 중 신규 디바이스가 추가되는 케이스가 완전히 누락되어 있었다.
+
+---
+
+## 기존 구조의 문제
+
+기존에는 Lambda 하나가 `CreateJob`, `UpdateJobExecution`, `DeleteJob` 세 가지를 모두 처리했다.
+
+이벤트명을 분기해서 각 처리 함수를 호출하는 구조였는데,
+Job 생성/삭제(생명주기)와 상태 업데이트(실시간 모니터링)가 한 함수 안에 혼재해 있었다.
+
+**1. 역할 혼재**
+Job 생성/삭제는 Job 생명주기 관리이고,
+상태 업데이트는 실시간 디바이스 모니터링이다.
+성격이 전혀 다른 두 역할이 한 함수에 섞여 있었다.
+
+**2. 신규 디바이스 누락**
+OTA Job은 Thing Group 단위로 생성된다.
+Job이 진행되는 도중 새 디바이스가 해당 Group에 추가되면
+그 디바이스는 DB에 등록되지 않아서
+앱에서 해당 디바이스의 OTA 상태를 전혀 볼 수 없었다.
+
+---
+
+## 개선 — 두 Lambda로 역할 분리
+
+### Job 생명주기 전담 Lambda
+
+CloudTrail 이벤트를 EventBridge로 수신해서 Job 생명주기만 처리한다.
+
+```
+EventBridge Rule
+    이벤트: CreateJob / AddThingToThingGroup / DeleteJob
+    ↓
+Lambda: Job 생명주기 처리 함수
+```
+
+EventBridge Rule 설정은 아래와 같다.
+
+```json
+{
+  "source": ["aws.iot"],
+  "detail-type": ["AWS API Call via CloudTrail"],
+  "detail": {
+    "eventSource": ["iot.amazonaws.com"],
+    "eventName": ["CreateJob", "AddThingToThingGroup", "DeleteJob"]
+  }
+}
+```
+
+각 이벤트별 처리는 아래와 같다.
+
+- **CreateJob** — `job_table` 등록 + ThingGroup 내 디바이스 전체를 `QUEUED`로 초기 등록
+- **AddThingToThingGroup** — 신규 디바이스를 즉시 `QUEUED`로 등록 (누락 케이스 방어)
+- **DeleteJob** — 관련 데이터 정리
+
+`AddThingToThingGroup` 처리 시 중복 등록 방지 로직을 추가했다.
+이미 row가 있으면 그대로 두고, 없을 때만 `QUEUED`로 생성한다.
+실시간 상태 갱신은 상태 업데이트 Lambda가 담당하므로 여기서는 건드리지 않는다.
+
+동작 흐름은 아래와 같다.
+
+1. `device_firmware` 테이블에서 해당 디바이스 row 존재 여부 확인
+2. 이미 있으면 → NOOP (상태는 상태 처리 Lambda가 실시간 갱신)
+3. 없으면 → `QUEUED` 상태로 1건 INSERT
+
+### 상태 업데이트 전담 Lambda
+
+이전 글에서 다룬 MQTT 이벤트 드리븐 구조다.
+`device_firmware` 상태 갱신만 담당하는 단일 책임을 가진다.
+
+```
+IoT Core MQTT 이벤트 ($aws/events/jobExecution/+/+)
+    ↓ IoT Rule
+Lambda: 상태 업데이트 처리 함수
+    ↓
+RDS: device_firmware UPSERT
+```
+
+---
+
+## 전체 구조 흐름
+
+```
+[Job 생성 시]
+앱 → OTA 시작 요청
+  → AWS IoT Core: CreateJob
+  → CloudTrail → EventBridge
+  → Job 생명주기 Lambda
+      → job_table 등록
+      → ThingGroup 내 디바이스 전체 QUEUED 등록
+
+[디바이스 상태 변경 시]
+디바이스 → MQTT 이벤트 발행
+  → IoT Rule → 상태 업데이트 Lambda
+      → device_firmware UPSERT
+
+[OTA 중 신규 디바이스 추가 시]
+신규 디바이스 → Thing Group 추가
+  → CloudTrail → EventBridge
+  → Job 생명주기 Lambda
+      → 신규 디바이스 QUEUED 즉시 등록
+```
+
+---
+
+## 개선 전후 비교
+
+| 항목               | 개선 전                       | 개선 후                                |
+| ------------------ | ----------------------------- | -------------------------------------- |
+| 트리거             | EventBridge 폴링 주기 (단일)  | CloudTrail 이벤트 + MQTT 이벤트 (분리) |
+| 역할               | Job 관리 + 상태 업데이트 혼재 | Job 생명주기 / 상태 업데이트 분리      |
+| 신규 디바이스 추가 | 누락                          | `AddThingToThingGroup` 즉시 처리       |
+| 상태 반영 지연     | 폴링 주기만큼 지연            | 즉시                                   |
+| 상태 전이 보호     | 없음                          | `SUCCEEDED` 덮어쓰기 차단              |
+| Lambda 실행        | 무조건 주기 실행              | 이벤트 발생 시에만 실행                |
+
+---
+
+## 정리
+
+폴링에서 이벤트 드리븐으로 바꾸는 것이 핵심처럼 보이지만,
+실제로는 **"이 Lambda가 무슨 책임을 갖는가"를 명확히 하는 것이 먼저**였다.
+
+역할을 분리하고 나니 각 Lambda의 트리거 방식도 자연스럽게 결정됐고,
+신규 디바이스 누락 케이스도 그 과정에서 발견하고 선제적으로 방어할 수 있었다.
+
+단일 책임 원칙은 코드 레벨만의 이야기가 아니라
+Lambda 같은 함수 단위 설계에도 똑같이 적용된다는 걸 실감한 작업이었다.
