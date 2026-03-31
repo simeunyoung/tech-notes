@@ -46,7 +46,7 @@ const SocialIcon = ({ kind, href, size = 8 }: SocialIconProps) => {
   return (
     <a
       className="text-sm text-gray-500 transition hover:text-gray-600"
-      target="_blank"
+      target={kind === 'mail' ? '_self' : '_blank'}
       rel="noopener noreferrer"
       href={href}
     >
