@@ -16,6 +16,7 @@ interface PaginationProps {
 interface ListLayoutProps {
   posts: CoreContent<Blog>[]
   title: string
+  totalPosts: number
   initialDisplayPosts?: CoreContent<Blog>[]
   pagination?: PaginationProps
 }
@@ -73,6 +74,7 @@ function Pagination({ totalPages, currentPage }: PaginationProps) {
 export default function ListLayoutWithTags({
   posts,
   title,
+  totalPosts,
   initialDisplayPosts = [],
   pagination,
 }: ListLayoutProps) {
@@ -80,7 +82,6 @@ export default function ListLayoutWithTags({
   const tagCounts = tagData as Record<string, number>
   const tagKeys = Object.keys(tagCounts)
   const sortedTags = tagKeys.sort((a, b) => tagCounts[b] - tagCounts[a])
-  const totalPostCount = tagKeys.reduce((acc, t) => acc + tagCounts[t], 0)
 
   const displayPosts = initialDisplayPosts.length > 0 ? initialDisplayPosts : posts
 
@@ -106,7 +107,7 @@ export default function ListLayoutWithTags({
                     <span className="text-primary-600 dark:text-primary-400 flex items-center justify-between rounded-lg px-2 py-1.5 text-sm font-semibold">
                       <span>전체 글</span>
                       <span className="text-primary-400 dark:text-primary-500 font-mono text-xs">
-                        {totalPostCount}
+                        {totalPosts}
                       </span>
                     </span>
                   ) : (
@@ -116,7 +117,7 @@ export default function ListLayoutWithTags({
                     >
                       <span>전체 글</span>
                       <span className="font-mono text-xs text-gray-400 dark:text-gray-500">
-                        {totalPostCount}
+                        {totalPosts}
                       </span>
                     </Link>
                   )}

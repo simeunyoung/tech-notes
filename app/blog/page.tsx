@@ -20,6 +20,7 @@ export default async function BlogPage(props: { searchParams: Promise<{ page: st
   return (
     <ListLayout
       posts={posts}
+      totalPosts={posts.length}
       initialDisplayPosts={initialDisplayPosts}
       pagination={pagination}
       title="All Posts"

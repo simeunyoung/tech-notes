@@ -42,9 +42,12 @@ export default async function TagPage(props: { params: Promise<{ tag: string; pa
     totalPages: totalPages,
   }
 
+  const allPosts = allCoreContent(sortPosts(allBlogs))
+
   return (
     <ListLayout
       posts={filteredPosts}
+      totalPosts={allPosts.length}
       initialDisplayPosts={initialDisplayPosts}
       pagination={pagination}
       title={title}
