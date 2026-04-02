@@ -1,0 +1,166 @@
+---
+title: 'EC2 부팅 실패로 시작된 t2 → t3 전환 작업'
+date: '2026-04-02'
+draft: false
+summary: '개발 서버 EC2 인스턴스가 스케줄 부팅에 실패하면서 원인을 분석하고, 전체 개발 서버를 t2에서 t3로 전환한 과정을 정리한다.'
+tags: ['infra', 'troubleshooting']
+---
+
+## 발단
+
+개발 서버 중 하나가 2026-03-26 09:02 스케줄 자동 시작 시 부팅에 실패했다.
+AWS 콘솔에서 인스턴스 상태 검사 실패가 확인됐고 SSH 접속도 불가했다.
+t2는 Xen 기반이라 EC2 직렬 콘솔을 지원하지 않아 복구 수단이 제한적이었다.
+결국 수동 재부팅으로 약 1시간 후 임시 복구했다.
+
+---
+
+## 원인 분석
+
+인스턴스 스크린샷에서 `Welcome to GRUB!` 화면에서 멈춰 있었고,
+핵심 오류 로그는 아래와 같았다.
+
+```
+kernel: Cannot get hvm parameter CONSOLE_EVTCHN (18): -22!
+```
+
+t2는 구형 **Xen 하이퍼바이저** 기반이라 부팅 시 커널이 콘솔 채널 번호를 요청하는데,
+Xen이 `-22 (EINVAL)`을 반환한다.
+
+평소에는 무시하고 부팅이 계속되지만,
+**매일 재부팅하는 스케줄 운영 환경**에서 타이밍 이슈로 간헐적으로 부팅이 중단된다.
+
+---
+
+## t2 → t3 전환 결정
+
+단순 재부팅으로 임시 복구는 됐지만, 재발 가능성이 있기 때문에 근본 해결을 위해 t3 전환을 결정했다.
+
+### 왜 t3인가
+
+| 항목           | t2         | t3           |
+| -------------- | ---------- | ------------ |
+| 하이퍼바이저   | Xen (구형) | Nitro (최신) |
+| EC2 직렬 콘솔  | ❌ 미지원  | ✅ 지원      |
+| 이번 오류 재발 | 가능       | 없음         |
+| 비용           | 기준       | 약 17% 저렴  |
+
+vCPU, 메모리 스펙은 동일하고 비용까지 더 저렴하다.
+t3a(AMD)가 더 저렴하지만 애플리케이션 호환성 테스트가 필요해서 t3를 선택했다.
+
+---
+
+## 사전 확인 — Public IP 여부
+
+타입 변경은 인스턴스를 중지(Stop) 후 시작(Start)해야 한다.
+Elastic IP가 아닌 Public IP를 사용 중이라면 Stop/Start 후 IP가 바뀐다.
+
+```bash
+aws ec2 describe-instances --instance-ids {instance-id} \
+  --query 'Reservations[].Instances[].[PublicIpAddress,PrivateIpAddress]'
+```
+
+개발 서버들은 Public IP 없이 Private IP만 사용 중이어서 IP 변경 걱정이 없었다.
+Bastion은 Elastic IP가 붙어있어 마찬가지로 고정 상태였다.
+
+---
+
+## 전환 작업
+
+### 작업 순서 (인스턴스별 반복)
+
+```bash
+# 1. 중지
+aws ec2 stop-instances --instance-ids {instance-id}
+aws ec2 wait instance-stopped --instance-ids {instance-id} && echo "중지 완료"
+
+# 2. 타입 변경
+aws ec2 modify-instance-attribute \
+  --instance-id {instance-id} \
+  --instance-type '{"Value": "t3.large"}'
+
+# 3. 시작
+aws ec2 start-instances --instance-ids {instance-id}
+aws ec2 wait instance-running --instance-ids {instance-id} && echo "시작 완료"
+```
+
+### 개발 서버 일괄 작업
+
+개발 서버는 동시에 중지/시작해도 무방하므로 3대를 한 번에 처리했다.
+`modify-instance-attribute`는 인스턴스별로 각각 실행해야 한다.
+
+```bash
+# 동시 중지
+aws ec2 stop-instances --instance-ids {id-1} {id-2} {id-3}
+aws ec2 wait instance-stopped --instance-ids {id-1} {id-2} {id-3} && echo "중지 완료"
+
+# 타입 변경 (각각)
+aws ec2 modify-instance-attribute --instance-id {id-1} --instance-type '{"Value": "t3.large"}'
+aws ec2 modify-instance-attribute --instance-id {id-2} --instance-type '{"Value": "t3.large"}'
+aws ec2 modify-instance-attribute --instance-id {id-3} --instance-type '{"Value": "t3.large"}'
+
+# 동시 시작
+aws ec2 start-instances --instance-ids {id-1} {id-2} {id-3}
+aws ec2 wait instance-running --instance-ids {id-1} {id-2} {id-3} && echo "시작 완료"
+```
+
+### Bastion 별도 작업
+
+Bastion도 매일 스케줄로 재부팅하는 환경이라 함께 전환했다.
+SSH 터널링 용도라 t3.micro로 변경했다.
+
+```bash
+aws ec2 stop-instances --instance-ids {bastion-id}
+aws ec2 wait instance-stopped --instance-ids {bastion-id} && echo "중지 완료"
+
+aws ec2 modify-instance-attribute \
+  --instance-id {bastion-id} \
+  --instance-type '{"Value": "t3.micro"}'
+
+aws ec2 start-instances --instance-ids {bastion-id}
+aws ec2 wait instance-running --instance-ids {bastion-id} && echo "시작 완료"
+```
+
+---
+
+## 결과
+
+| 서버 역할     | 변경 전  | 변경 후  |
+| ------------- | -------- | -------- |
+| 서비스 서버 A | t2.large | t3.large |
+| 서비스 서버 B | t2.large | t3.large |
+| 서비스 서버 C | t2.large | t3.large |
+| 서비스 서버 D | t2.large | t3.large |
+| Bastion       | t2.micro | t3.micro |
+
+전환 후 아래 명령으로 오류 로그 확인
+
+```bash
+journalctl -b | grep CONSOLE_EVTCHN
+```
+
+아무것도 출력되지 않아 오류 해소 확인 완료.
+모든 서버 Private IP 및 애플리케이션 설정은 그대로 유지됐다.
+
+---
+
+## 배운 점
+
+**t2는 Xen 기반이라 EC2 직렬 콘솔을 지원하지 않는다.**
+부팅 실패 시 스크린샷으로만 상태를 확인할 수 있고 직접 접속해서 복구하는 수단이 없다.
+t3(Nitro) 이상으로 전환하면 직렬 콘솔로 직접 접속해서 복구가 가능하다.
+
+**EBS 기반 인스턴스는 타입 변경 후에도 OS, 설정, 데이터가 그대로 유지된다.**
+별도 재설정 없이 타입만 바꾸면 된다.
+
+**Elastic IP를 사용하지 않는 경우 Stop/Start 후 Public IP가 바뀐다.**
+작업 전에 반드시 Elastic IP 여부와 Public IP 사용 여부를 확인해야 한다.
+매일 스케줄로 재부팅하는 환경이라면 처음부터 t3 이상을 사용하는 것이 낫다.
+
+---
+
+## 관련 글
+
+이 글은 아래 트러블슈팅 글에서 이어진 작업이다.
+
+👉 [EC2 스케줄 부팅 실패 트러블슈팅 — CONSOLE_EVTCHN 오류](/blog/2026-03-26-ec2-boot-failure-troubleshooting)
