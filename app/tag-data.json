@@ -1,4 +1,10 @@
 {
-  "ops": 2,
-  "troubleshooting": 2
+  "devops": 5,
+  "troubleshooting": 7,
+  "spring-boot": 2,
+  "backend": 2,
+  "infra": 7,
+  "server": 3,
+  "git": 1,
+  "ops": 1
 }
