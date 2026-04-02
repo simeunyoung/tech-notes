@@ -1,0 +1,229 @@
+---
+title: 'AWS IoT Core 디바이스 등록 및 인증서 발급 — CLI로 정리하기'
+date: '2026-04-03'
+draft: false
+summary: '신규 디바이스가 AWS IoT Core에 접속할 수 있도록 Thing 생성부터 인증서 발급, 정책 연결, 파일 전달까지 CLI 기준으로 전 과정을 정리한다.'
+tags: ['infra', 'devops']
+---
+
+## 배경
+
+신규 모듈이 AWS IoT Core에 접속할 수 있도록 Thing을 생성하고 인증서를 발급해서 담당자에게 전달하는 작업이 필요했다.
+CLI(AWS CloudShell) 기준으로 전 과정을 정리해둔다.
+
+---
+
+## 개념 정리
+
+**Thing (사물)**
+AWS IoT Core에 등록된 디바이스를 의미한다. 각 모듈마다 개별 Thing을 생성해야 한다.
+
+**인증서 (Certificate)**
+디바이스의 신원을 증명하는 파일이다. 디바이스마다 반드시 개별 생성해야 하며 공유하면 안 된다.
+하나의 인증서가 폐기되면 공유하는 모든 디바이스에 영향이 간다.
+생성 시 **단 한 번만 다운로드 가능**하다. 분실 시 재발급이 필요하다.
+
+**개인키 (Private Key)**
+인증서가 "내 것"임을 증명하는 서명용 키다.
+AWS IoT Core 접속 시 인증서 + 개인키가 함께 있어야 한다. **절대 외부 노출 금지.**
+
+**루트 CA (AmazonRootCA1.pem)**
+디바이스가 "상대방 서버가 진짜 AWS인지" 검증하는 최상위 인증서다.
+AWS가 공개 배포하는 파일이라 모든 디바이스에서 동일한 파일을 사용한다.
+
+**정책 (Policy)**
+"어떤 IoT 작업을 허용하는가"를 정의하는 규칙이다.
+여러 인증서에서 공용으로 재사용할 수 있다. 기존 정책이 있다면 새로 만들 필요 없다.
+
+### 생성 전략 요약
+
+| 항목   | 전략        | 이유                            |
+| ------ | ----------- | ------------------------------- |
+| Thing  | 새로 생성   | 디바이스마다 고유해야 함        |
+| 인증서 | 새로 생성   | 공유 시 하나 폐기되면 모두 영향 |
+| 개인키 | 새로 생성   | 인증서와 세트로 생성됨          |
+| 정책   | 기존 재사용 | 규칙만 정의하는 파일, 공용 가능 |
+
+---
+
+## 사전 현황 파악
+
+작업 전 기존 Thing, 인증서, 정책 목록을 확인한다.
+
+```bash
+# Thing 목록
+aws iot list-things --region ap-northeast-2
+
+# 인증서 목록
+aws iot list-certificates --region ap-northeast-2
+
+# 정책 목록
+aws iot list-policies --region ap-northeast-2
+
+# 특정 Thing에 연결된 인증서 확인
+aws iot list-thing-principals --thing-name "Thing이름" --region ap-northeast-2
+```
+
+---
+
+## 작업 순서
+
+### Step 1. Thing 생성
+
+```bash
+aws iot create-thing \
+  --thing-name "디바이스이름" \
+  --region ap-northeast-2
+```
+
+### Step 2. 인증서 생성
+
+```bash
+aws iot create-keys-and-certificate \
+  --set-as-active \
+  --certificate-pem-outfile "디바이스이름.cert.pem" \
+  --public-key-outfile "디바이스이름.public.key" \
+  --private-key-outfile "디바이스이름.private.key" \
+  --region ap-northeast-2
+```
+
+출력 결과에서 `certificateArn` 값을 반드시 메모해둔다. 다음 단계에서 사용한다.
+
+```
+arn:aws:iot:ap-northeast-2:{account-id}:cert/abc123...
+```
+
+- `--outfile` 옵션으로 CloudShell 로컬에 바로 저장된다
+- 파일명은 Thing 이름과 맞춰두면 관리가 편하다
+- 인증서 ID/ARN은 AWS가 자동 생성하며 파일명과 무관하다
+
+### Step 3. 정책 연결
+
+기존 정책을 재사용한다. 새로 만들 필요 없다.
+
+```bash
+aws iot attach-policy \
+  --policy-name "기존정책이름" \
+  --target "certificateArn값" \
+  --region ap-northeast-2
+```
+
+새로 만들어야 할 때,
+
+```bash
+aws iot create-policy \
+  --policy-name "MyDevicePolicy" \
+  --policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Action": ["*"],
+      "Resource": "*"
+    }]
+  }' \
+  --region ap-northeast-2
+```
+
+### Step 4. 인증서를 Thing에 연결
+
+```bash
+aws iot attach-thing-principal \
+  --thing-name "디바이스이름" \
+  --principal "certificateArn값" \
+  --region ap-northeast-2
+```
+
+### Step 5. 루트 CA 다운로드
+
+```bash
+curl -o AmazonRootCA1.pem \
+  https://www.amazontrust.com/repository/AmazonRootCA1.pem
+```
+
+### Step 6. 파일 zip으로 묶기
+
+```bash
+zip certs.zip \
+  디바이스이름.cert.pem \
+  디바이스이름.private.key \
+  디바이스이름.public.key \
+  AmazonRootCA1.pem
+```
+
+### Step 7. CloudShell에서 파일 다운로드
+
+```
+CloudShell 우측 상단 Actions 버튼
+→ Download file
+→ 경로 입력: /home/cloudshell-user/certs.zip
+```
+
+### Step 8. CloudShell 파일 삭제
+
+다운로드 확인 후 CloudShell에 남은 파일을 즉시 삭제한다.
+인증서 파일을 서버에 남겨두면 보안상 위험하다.
+
+```bash
+rm 디바이스이름.cert.pem \
+   디바이스이름.private.key \
+   디바이스이름.public.key \
+   AmazonRootCA1.pem \
+   certs.zip
+
+# 삭제 확인
+ls -la | grep -E "pem|key|zip"
+```
+
+---
+
+## IoT 엔드포인트 확인
+
+```bash
+aws iot describe-endpoint \
+  --endpoint-type iot:Data-ATS \
+  --region ap-northeast-2
+```
+
+출력 결과 예시
+
+```
+xxxxxxxxxxxx.iot.ap-northeast-2.amazonaws.com
+```
+
+---
+
+## 담당자 전달 목록
+
+| 파일 / 정보                | 설명                   | 비고                     |
+| -------------------------- | ---------------------- | ------------------------ |
+| `디바이스이름.cert.pem`    | 디바이스 인증서        | 공개해도 무방            |
+| `디바이스이름.private.key` | 개인키                 | **절대 외부 노출 금지**  |
+| `AmazonRootCA1.pem`        | 루트 CA 인증서         | 모든 디바이스 공통       |
+| IoT 엔드포인트 주소        | AWS IoT Core 접속 주소 | describe-endpoint 결과값 |
+
+> `public.key`는 실제 디바이스 연결에 사용하지 않으므로 전달 불필요
+
+---
+
+## GUI vs CLI
+
+AWS 콘솔 GUI로도 동일한 작업이 가능하다.
+
+| 항목        | GUI                       | CLI                            |
+| ----------- | ------------------------- | ------------------------------ |
+| 인증서 생성 | "새 인증서 자동생성" 클릭 | `create-keys-and-certificate`  |
+| 파일 저장   | 다운로드 버튼 클릭        | `--outfile` 옵션으로 자동 저장 |
+| 내부 동작   | 동일                      | 동일                           |
+| 장점        | 직관적                    | 재현 가능, 문서화 용이         |
+
+CLI 방식이 작업 내용을 문서로 남기기 좋고 반복 작업 시 실수가 적다.
+
+---
+
+## 주의사항
+
+- 인증서는 생성 시 **단 한 번만** 다운로드 가능하다. 분실 시 AWS에서 재제공하지 않는다
+- 인증서 분실 시 기존 인증서를 비활성화하고 신규 발급이 필요하다
+- CloudShell에 인증서 파일을 남겨두지 말 것. 다운로드 후 즉시 삭제한다
+- `private.key`는 절대 외부에 노출하지 않는다
+- 인증서를 여러 디바이스가 공유하면 하나 폐기 시 모두 영향을 받는다
