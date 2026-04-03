@@ -1,0 +1,194 @@
+---
+title: 'Amazon Linux 2023에 Redis 설치하기 — 도입 배경부터 설치 트러블슈팅까지'
+date: '2026-04-04'
+draft: false
+summary: '디바이스 수 증가에 따른 DB 부하를 선제적으로 해결하기 위해 Redis 캐싱을 도입한 배경과, AL2023에서 발생한 DNF 리전 설정 오류를 해결하며 설치한 과정을 정리한다.'
+tags: ['infra', 'server']
+---
+
+## 도입 배경
+
+IoT 디바이스와 외부 서비스를 연동하는 기능을 개발하던 중 코드 리뷰를 하다가 이런 생각이 들었다.
+
+> "디바이스가 10분마다 주기적으로 MQTT를 보내는데, 디바이스 수가 많아지면 DB에 계속 검증 요청이 가서 부하가 생기지 않을까?"
+
+실제로 계산해보면 규모가 커질수록 부담이 상당하다.
+
+```
+디바이스 1,000개 × 10분마다 1회 = 시간당 6,000번 DB 조회
+```
+
+문제가 터진 후에 해결하는 것보다 미리 대비하는 것이 낫다고 판단해서
+Redis 캐싱 도입을 제안했고 채택되어 직접 설치 및 설정을 진행하게 됐다.
+
+---
+
+## 해결 방향 — Redis 캐싱
+
+기본 아이디어는 단순하다.
+DB 조회 결과를 Redis에 저장해두고, 같은 디바이스가 다시 요청하면 DB 대신 Redis에서 바로 응답한다.
+
+```
+MQTT 수신
+     ↓
+Redis 확인
+     ├── Hit  → 바로 처리 (DB 조회 없음)
+     └── Miss → DB 조회 → Redis 저장 → 처리
+```
+
+디바이스 등록/삭제가 빈번하게 발생하기 때문에 TTL에만 의존하지 않고,
+이벤트 발생 시 Redis를 즉시 갱신하는 방식도 함께 채택했다.
+
+```
+디바이스 등록/삭제 이벤트
+     ↓
+DB 업데이트 → Redis 즉시 갱신
+```
+
+---
+
+## 환경
+
+- OS: Amazon Linux 2023
+- Redis: redis6
+
+---
+
+## 설치 전 트러블슈팅 — DNF 리전 오류
+
+### 증상
+
+설치를 시도했더니 아래 에러가 발생했다.
+
+```bash
+$ sudo dnf install -y redis6
+
+Errors during downloading metadata for repository 'amazonlinux':
+  - Curl error (6): Couldn't resolve host name for
+    https://al2023-repos-default-de612dc2.s3.dualstack.default.amazonaws.com/...
+Error: Failed to download metadata for repo 'amazonlinux'
+```
+
+구글 연결은 정상이었지만 AWS S3 저장소 주소를 찾지 못하는 상황이었다.
+
+```bash
+$ curl -I https://google.com
+HTTP/2 301  # 정상
+
+$ nslookup al2023-repos-default-de612dc2.s3.dualstack.default.amazonaws.com
+** server can't find ... NXDOMAIN  # 실패
+```
+
+### 원인
+
+DNF 설정 파일을 확인해보니 리전이 `default`로 잘못 설정되어 있었다.
+
+```bash
+$ cat /etc/dnf/vars/awsregion
+default  # 문제 원인
+```
+
+AL2023의 패키지 저장소 주소는 리전 값을 기반으로 생성되는데,
+`default`라는 리전은 존재하지 않아서 DNS 조회에 실패한 것이었다.
+
+### 해결 1 — DNF 리전 설정 변경
+
+```bash
+# 서울 리전으로 변경
+echo "ap-northeast-2" | sudo tee /etc/dnf/vars/awsregion
+
+# 확인
+cat /etc/dnf/vars/awsregion
+# ap-northeast-2
+```
+
+### 해결 2 — S3 VPC 엔드포인트 추가 (선택사항)
+
+리전 설정만으로도 해결이 가능하지만, 보안과 성능을 위해 S3 VPC 엔드포인트도 함께 추가했다.
+
+엔드포인트가 없으면 EC2 → 인터넷 → S3 경로를 타지만,
+엔드포인트를 추가하면 EC2 → AWS 내부망 → S3로 직접 연결된다.
+
+> Gateway 타입 S3 엔드포인트는 무료다.
+
+추가 방법: AWS 콘솔 → VPC → Endpoints → Create endpoint
+
+- Service: `com.amazonaws.ap-northeast-2.s3` (Gateway 타입)
+- VPC: 해당 VPC 선택
+- Route tables: 해당 라우팅 테이블 선택 후 생성
+
+---
+
+## Redis 설치
+
+```bash
+sudo dnf install -y redis6
+```
+
+---
+
+## 시작 및 자동 시작 등록
+
+```bash
+# 시작
+sudo systemctl start redis6
+
+# 서버 재부팅 시 자동 시작 등록
+sudo systemctl enable redis6
+
+# 상태 확인
+sudo systemctl status redis6
+# Active: active (running) 이 나오면 정상
+```
+
+---
+
+## 비밀번호 설정
+
+Redis는 기본적으로 비밀번호 없이 누구나 접속할 수 있다.
+운영 환경에서는 반드시 비밀번호를 설정해야 한다.
+
+```bash
+sudo vi /etc/redis6/redis6.conf
+```
+
+`requirepass` 항목을 찾아 수정한다.
+
+```bash
+# 수정 전
+# requirepass foobared
+
+# 수정 후
+requirepass 비밀번호입력
+```
+
+```bash
+# 설정 저장 후 재시작
+sudo systemctl restart redis6
+```
+
+---
+
+## 설치 확인
+
+> AL2023은 `redis-cli`가 아니라 `redis6-cli`를 사용한다.
+
+```bash
+redis6-cli -a 비밀번호 ping
+# PONG 이 나오면 성공
+```
+
+---
+
+## 정리
+
+| 항목        | 내용                                                       |
+| ----------- | ---------------------------------------------------------- |
+| 도입 이유   | 디바이스 수 증가에 따른 DB 부하 선제적 해결                |
+| 캐싱 전략   | Cache Hit 시 DB 조회 없음, Miss 시 DB 조회 후 저장         |
+| 캐시 갱신   | TTL 의존 X, 등록/삭제 이벤트 발생 시 즉시 갱신             |
+| 설치 트러블 | DNF awsregion이 `default`로 설정되어 저장소 주소 조회 실패 |
+| 해결        | 리전 `ap-northeast-2`로 변경 + S3 VPC 엔드포인트 추가      |
+
+도입으로 기대하는 효과는 캐시 히트 시 DB 조회 자체가 없어지므로 DB 부하가 대폭 줄어드는 것이다.
+등록/삭제 이벤트 기반 갱신으로 TTL만 의존할 때 생기는 정합성 문제도 함께 해결했다.
