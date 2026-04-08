@@ -1,0 +1,184 @@
+---
+title: '@Transactional + retry 루프 공존으로 인한 UnexpectedRollbackException 트러블슈팅'
+date: '2026-04-06'
+draft: false
+summary: '성공 로그가 찍힌 직후 UnexpectedRollbackException이 발생하는 모순적인 상황의 원인을 분석하고 해결한 과정을 정리한다.'
+tags: ['spring-boot', 'backend', 'troubleshooting']
+---
+
+## 상황
+
+IoT 기기 데이터를 MQTT로 수신해 DB에 적재하는 모듈에서 아래와 같은 에러가 반복 발생했다.
+
+```
+INFO  ResourceHistoryService - Resource history saved successfully
+ERROR CurrentStatusService  - Device not found
+WARN  MqttMessageHandler    - [RETRY] Device Not Found (1/5) backoff=1000ms
+WARN  MqttMessageHandler    - [RETRY] Device Not Found (2/5) backoff=2000ms
+WARN  MqttMessageHandler    - [RETRY] Device Not Found (3/5) backoff=4000ms
+INFO  CurrentStatusService  - CurrentStatus updated successfully
+INFO  StatusHistoryService  - StatusHistory processed successfully
+INFO  MqttMessageHandler    - <<< [END] Saved (History & Status)
+
+ERROR SimpleAsyncUncaughtExceptionHandler - Unexpected exception occurred invoking async method
+org.springframework.transaction.UnexpectedRollbackException:
+    Transaction silently rolled back because it has been marked as rollback-only
+```
+
+성공 로그가 찍히고 나서 바로 롤백 에러가 발생하는 모순적인 상황이었다.
+처음에는 데이터 유실로 의심했지만 DB를 직접 확인해보니 데이터는 정상 존재했다.
+
+---
+
+## 시스템 구조
+
+MQTT 메시지를 수신하면 `handleAsync()`가 비동기로 호출되고, 내부에서 3개의 서비스를 순서대로 실행한다.
+
+```
+handleAsync(dto)
+  ├─ 원본 페이로드 저장
+  ├─ 기기 현재 상태 업데이트
+  └─ 상태 변경 이력 저장
+```
+
+기기 등록과 거의 동시에 MQTT 메시지가 들어오는 경우가 있어서,
+`기기 현재 상태 업데이트()`에서 `Device not found` 예외가 발생하면 최대 5회까지 재시도하는 구조였다.
+재시도하는 사이 기기 등록이 완료되면 성공할 수 있도록 설계한 것이었다.
+
+---
+
+## 문제의 구조
+
+`handleAsync()` 메서드에 두 가지 문제가 동시에 존재했다.
+
+1. `@Transactional`이 선언되어 있고 내부에 retry 루프가 있다
+2. 원본 로그 저장 로직이 retry 루프 안에 있어서 재시도마다 중복 호출된다
+
+```
+handleAsync()                   ← @Transactional + retry 루프 공존 (문제)
+  └─ [retry loop]
+       └─ 원본 로그 저장          ← 루프 안에 있어서 재시도마다 중복 호출 (문제)
+       └─ 현재 상태 업데이트      ← Device not found 예외 발생
+       └─ 상태 이력 저장
+```
+
+---
+
+## 원인 분석
+
+### @Transactional + retry 루프의 충돌
+
+Spring의 `@Transactional` 기본 전파 레벨은 `REQUIRED`다.
+`handleAsync()`가 트랜잭션을 시작하면 내부에서 호출되는 모든 서비스 메서드들이 그 트랜잭션에 **참여**한다.
+
+```
+handleAsync()              ← @Transactional → 외부 트랜잭션 T 시작
+  └─ 원본 로그 저장         ← REQUIRED → T에 참여
+  └─ 현재 상태 업데이트     ← REQUIRED → T에 참여
+       예외 발생!
+       → T가 rollback-only로 마킹됨  ← 핵심
+  └─ [retry] 현재 상태 업데이트 재시도
+       성공해도 T는 이미 rollback-only 상태
+       → 커밋 시도 → UnexpectedRollbackException
+```
+
+Spring에서 내부 서비스가 예외를 던지면 참여 중인 외부 트랜잭션이 `rollback-only`로 마킹된다.
+**이 마킹은 이후 취소할 수 없다.**
+
+catch 블록에서 예외를 잡아 재시도를 하더라도 외부 트랜잭션은 이미 오염된 상태다.
+이후 재시도에서 모든 게 성공해서 성공 로그가 찍혀도,
+마지막 커밋 시점에 Spring이 이 트랜잭션은 롤백해야 한다고 판단해서 `UnexpectedRollbackException`을 던진다.
+
+**로그상 성공처럼 보이는데 에러가 나는 이유가 바로 이것이다.**
+서비스 내부의 저장 로직은 성공했지만 외부 트랜잭션 커밋 단계에서 실패한 것이다.
+
+### 실제 발생 타임라인
+
+| 시각   | 동작                             | 결과                                             |
+| ------ | -------------------------------- | ------------------------------------------------ |
+| T+0s   | MQTT 수신, 외부 트랜잭션 T 시작  | -                                                |
+| T+0s   | 원본 로그 저장 실행              | 성공 로그 출력 (커밋 전, T에 묶여있음)           |
+| T+0s   | 현재 상태 업데이트 — 기기 미등록 | 예외 → **T rollback-only 마킹**                  |
+| T+1~3s | 재시도 1~3회                     | 원본 로그 저장 중복 호출 + Device not found 반복 |
+| T+3s   | (다른 경로로 기기 등록 완료)     | -                                                |
+| T+7s   | 재시도 4회 — 기기 찾음           | 성공 로그 출력                                   |
+| T+7s   | 커밋 시도                        | **UnexpectedRollbackException**                  |
+
+### 부가 문제: resourceHistoryIns() 중복 호출
+
+`원본 로그 저장 ()`이 retry 루프 안에 있어서 재시도할 때마다 매번 호출됐다.
+이번 케이스에서는 재시도 4회 → 4번 저장 시도가 발생했다.
+(최종 롤백으로 중복 레코드는 없었지만 구조적으로 위험하다)
+
+---
+
+## DB 확인 결과
+
+에러가 났음에도 DB를 조회해보니 데이터가 정상 존재했다.
+
+| 테이블                  | 확인 결과                     |
+| ----------------------- | ----------------------------- |
+| 원본 페이로드 저장      | 정상 저장                     |
+| 기기 현재 상태 업데이트 | 정상 저장                     |
+| 상태 변경 이력 저장     | notify 미수신으로 없음 (정상) |
+
+데이터가 살아있었던 이유는 각 서비스가 자체 `@Transactional`을 가지고 있어 독립적으로 커밋을 완료했기 때문이다.
+
+이번 케이스에서는 **실제 데이터 유실은 없었다.**
+하지만 이건 우연히 살아난 것에 가깝고, 트랜잭션 전파 설정이나 서비스 구조가 바뀌면 실제 롤백이 발생할 수 있는 잠재적 위험 구조였다.
+
+---
+
+## 해결
+
+### 핵심: handleAsync()에서 @Transactional 제거
+
+각 서비스가 이미 자체 `@Transactional`을 가지고 있으므로 외부에서 트랜잭션으로 묶을 필요가 없다.
+retry 루프는 트랜잭션 밖에서 동작해야 한다.
+
+추가로 원본 로그 저장을 retry 루프 밖으로 꺼내서 1회만 호출되도록 수정했다.
+
+```
+handleAsync()                        ← @Transactional 제거
+  └─ 원본 로그 저장                   ← 루프 밖으로 이동, 1회만 실행
+  └─ 제어 토픽 여부 확인 후 분기
+  └─ [retry loop]                    ← 현재 상태 + 이력만 재시도 대상
+       └─ 현재 상태 업데이트
+       └─ 상태 이력 저장
+```
+
+### 수정 전후 비교
+
+| 항목                | 수정 전                       | 수정 후                 |
+| ------------------- | ----------------------------- | ----------------------- |
+| `@Transactional`    | `handleAsync()`에 선언        | 제거                    |
+| 원본 로그 저장 위치 | retry 루프 안 (최대 5회)      | retry 루프 밖 (1회)     |
+| retry 대상          | 전체 서비스 포함              | 현재 상태 + 이력 저장만 |
+| 제어 토픽 분기      | 루프 안                       | 루프 진입 전            |
+| 재시도 성공 시 결과 | `UnexpectedRollbackException` | 정상 커밋               |
+
+---
+
+## 정리
+
+### @Transactional + retry 루프는 같은 메서드에 두면 안 된다
+
+retry 로직의 전제는 "예외가 발생해도 다시 시도할 수 있다"는 것이다.
+하지만 `@Transactional`이 걸린 메서드 안에서 예외가 발생하면 트랜잭션이 `rollback-only`로 마킹되고 이 상태는 되돌릴 수 없다.
+아무리 재시도에 성공해도 커밋이 불가능해진다.
+
+### retry와 트랜잭션을 함께 써야 한다면
+
+**방법 1 — retry 메서드에서 `@Transactional` 제거** (이번에 적용)
+각 서비스의 개별 트랜잭션에 위임한다. 서비스 간 원자성이 필요 없을 때 적합하다.
+
+**방법 2 — 내부 서비스에 `REQUIRES_NEW` 전파 레벨 사용**
+
+현재 상태 업데이트 서비스에 `REQUIRES_NEW` 전파 레벨을 적용한다.
+예외 발생 시 내부 트랜잭션만 롤백되고 외부 트랜잭션은 오염되지 않는다.
+서비스 간 원자성 보장이 필요한 경우에 사용한다.
+
+### 로그를 맹신하지 말 것
+
+성공 로그가 찍혀도 외부 트랜잭션 커밋 단계에서 실패할 수 있다.
+에러가 의심되면 DB를 직접 조회해서 실제 저장 여부를 확인해야 한다.
