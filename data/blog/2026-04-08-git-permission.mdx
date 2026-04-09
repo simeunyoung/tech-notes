@@ -1,0 +1,119 @@
+---
+title: 'Git 파일 퍼미션 변경으로 인한 pull 충돌 해결'
+date: '2026-04-08'
+draft: false
+summary: 'chmod -R 755 실행 후 git pull 충돌이 발생했을 때 git restore로 해결하는 방법과 각 접근법의 차이를 정리한다.'
+tags: ['git', 'server', 'troubleshooting']
+---
+
+## 배경
+
+업무 인수인계 후 첫 배포를 시도하던 중 문제가 발생했다.
+서버에 이미 `chmod -R 755 ./*`가 실행된 이력이 있었고, 이 상태에서 `git pull`을 시도하자 충돌이 발생하며 pull이 중단됐다.
+Git은 파일 퍼미션 변경도 코드 수정으로 인식하기 때문에 발생한 문제였다.
+
+## 증상
+
+```
+error: Your local changes to the following files would be overwritten by merge:
+    src/main/java/.../MessageHandler.java
+Please commit your changes or stash them before you merge.
+Aborting
+```
+
+실제 코드는 건드리지 않았는데도 수십 개의 파일이 변경된 것으로 감지됐다.
+
+## 원인 분석
+
+Git은 기본적으로 파일 퍼미션의 실행 비트(executable bit) 변경을 추적한다.
+`chmod -R 755 ./*`는 프로젝트 내 모든 파일에 실행 권한을 부여하므로, 기존에 `644`였던 파일들이 전부 수정된 것처럼 표시된다.
+
+이 상태에서 `git pull`을 시도하면 "로컬 변경사항이 있으니 먼저 처리하라"는 오류가 발생하며 병합이 중단된다.
+
+## 해결
+
+### 정석 해결법
+
+```bash
+git restore .   # git 기록 기준으로 퍼미션 + 내용 복원
+git pull        # pull 진행
+```
+
+`git restore .`는 git이 기록하고 있는 상태 그대로 모든 파일을 복원한다.
+필요한 파일에만 개별로 권한을 부여하면 된다. `chmod -R 755 ./*`는 이 개별 설정 대신 전체에 일괄 적용한 것이 원인이었다.
+
+```bash
+chmod +x gradlew
+```
+
+### 실제 코드 수정사항도 함께 있는 경우
+
+```bash
+git stash        # 변경사항 임시 저장
+git pull         # pull 진행
+git stash pop    # 변경사항 다시 적용 (충돌 시 수동 해결 필요)
+```
+
+## 해결 방법 비교
+
+| 방법                                   | 동작                                 | 장점                                            | 단점                                                     |
+| -------------------------------------- | ------------------------------------ | ----------------------------------------------- | -------------------------------------------------------- |
+| `git restore .`                        | git 기록 기준으로 퍼미션 + 내용 복원 | git 본연의 방법, 실행 파일 퍼미션도 정확히 복원 | -                                                        |
+| `find . -type f -exec chmod 644 {} \;` | 모든 파일을 644로 직접 변경          | -                                               | 실행 파일도 644로 변경되어 `Permission denied` 오류 발생 |
+| `git config core.fileMode false`       | git이 퍼미션 변경 자체를 무시        | 반복 문제 예방                                  | 근본 해결이 아닌 눈 감기                                 |
+
+### `find + chmod 644` 방법의 문제점
+
+```bash
+find . -type f -exec chmod 644 {} \;
+# 실행 파일도 644로 변경됨
+# → 실행 시 Permission denied 오류 발생
+```
+
+빌드 툴 자체가 실행 불가 상태가 되므로, 이 방법은 피해야 한다.
+
+## `git checkout -- .` vs `git restore .`
+
+두 명령어는 동작이 완전히 동일하다. `git checkout -- .`은 구버전 명령어다.
+
+| 명령어              | git 버전              | 비고      |
+| ------------------- | --------------------- | --------- |
+| `git checkout -- .` | git 2.23 이전         | 구버전    |
+| `git restore .`     | git 2.23 이후 (2019~) | 현재 권장 |
+
+`--`가 필요했던 이유는 `git checkout`이 브랜치 전환과 파일 복원이라는 두 가지 역할을 겸했기 때문이다.
+
+```bash
+git checkout develop      # 브랜치 전환
+git checkout -- develop   # "develop"이라는 파일을 복원
+```
+
+git 2.23에서 역할이 분리됐다.
+
+```bash
+git switch    # 브랜치 전환 전담
+git restore   # 파일 복원 전담
+```
+
+## 주의사항
+
+**`chmod -R 755 ./*`는 프로젝트 디렉토리에 절대 사용하지 않는다.**
+특정 파일에만 실행 권한이 필요한 경우 아래처럼 개별 지정한다.
+
+```bash
+# ❌ 잘못된 방법
+chmod -R 755 ./*
+
+# ✅ 올바른 방법
+chmod +x gradlew
+```
+
+## 정리
+
+| 상황                              | 해결 명령                                  |
+| --------------------------------- | ------------------------------------------ |
+| 퍼미션만 변경된 경우              | `git restore .` → `git pull`               |
+| 코드 수정 + 퍼미션 변경 혼재      | `git stash` → `git pull` → `git stash pop` |
+| 퍼미션 추적 자체를 끄고 싶은 경우 | `git config core.fileMode false`           |
+
+`git restore .` 하나로 해결되는 문제였지만, 잘못된 방법을 선택하면 빌드 자체가 깨지는 상황으로 이어질 수 있다. 퍼미션 문제가 생겼을 때는 `find + chmod` 대신 git 기록을 기준으로 복원하는 것이 가장 안전하다.
