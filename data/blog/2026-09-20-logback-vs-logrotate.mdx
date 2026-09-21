@@ -1,0 +1,109 @@
+---
+title: 'Logback 롤링 vs logrotate — Java 애플리케이션 로그는 어디서 회전해야 할까'
+date: '2026-09-20'
+draft: false
+summary: 'logrotate로 로그를 표준화하려던 계획이 팀 논의 끝에 Logback 자체 롤링으로 바뀐 이유를, Java 프로세스가 파일을 열어둔 상태에서 생기는 문제를 중심으로 정리한다.'
+tags: ['spring-boot', 'server', 'backend']
+---
+
+## 배경
+
+예전에 서버 디스크가 로그로 가득 차는 일이 있어서
+서버 전체에 `logrotate`를 적용해 로그 정책을 표준화한 적이 있다.
+
+이후 로그 구조를 개선하면서 서비스 4개(3개 환경)의 로그 정책을 다시 정리하게 됐고,
+처음에는 이번에도 OS 레벨의 `logrotate`로 표준화하는 방향이었다.
+하지만 **팀 논의 끝에 Logback 자체 롤링 정책으로 방향을 바꿨다.**
+그 이유를 정리했고, 나도 그 이유에 동의해서 4개 서비스에 직접 적용했다.
+
+---
+
+## logrotate로 하려던 이유
+
+`logrotate`는 OS 레벨에서 로그 파일을 관리한다.
+
+- 언어와 프레임워크에 상관없이 서버 전체의 로그를 **한 곳에서 같은 방식으로** 관리할 수 있다.
+- Java 서비스뿐 아니라 nginx, 시스템 로그 같은 것도 같은 정책으로 묶을 수 있다.
+- 서비스 코드를 건드리지 않는다.
+
+서비스마다 언어가 다르거나 애플리케이션 밖에서 쌓이는 로그가 많다면 여전히 좋은 선택이다.
+
+---
+
+## Java 앱에서는 파일 핸들이 문제
+
+문제는 **프로세스가 로그 파일을 열어둔 상태에서** 밖에서 파일을 회전시킬 때 생긴다.
+
+```
+1. Java 프로세스가 app.log를 열어 두고 계속 쓴다 (파일 핸들 유지)
+2. logrotate가 app.log를 app.log.1로 이름 변경하고 새 app.log를 만든다
+3. Java 프로세스는 여전히 처음 열었던 파일(이제 app.log.1)에 쓴다
+4. 새 app.log는 비어 있고, 로그는 회전된 파일로 계속 들어간다
+```
+
+프로세스가 파일을 다시 열지(reopen) 않으면 이런 일이 생긴다.
+회전된 파일이 압축되거나 삭제되면 그 뒤에 쓰인 로그는 유실된다.
+
+우회 방법으로 `copytruncate`가 있다.
+파일을 복사한 뒤 원본을 비우는 방식이라 프로세스가 파일을 다시 열 필요는 없다.
+다만 복사와 비우기 사이에 쓰인 로그가 사라질 수 있어서 **완전한 해결책은 아니다.**
+
+---
+
+## Logback 롤링
+
+Logback은 로그를 쓰는 프로세스가 직접 롤링을 관리한다.
+파일을 쓰는 주체와 회전하는 주체가 같기 때문에 위 문제가 애초에 생기지 않는다.
+
+설정은 아래와 같은 형태다. (구조를 보여주기 위한 예시다.)
+
+```xml
+<appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+  <file>logs/app.log</file>
+  <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+    <fileNamePattern>logs/app.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
+    <maxFileSize>100MB</maxFileSize>
+    <maxHistory>30</maxHistory>
+    <totalSizeCap>3GB</totalSizeCap>
+  </rollingPolicy>
+</appender>
+```
+
+- **날짜와 크기 기준으로 파일을 나누고** 압축한다.
+- `maxHistory`로 보관 기간을 정한다.
+- `totalSizeCap`으로 전체 로그가 차지하는 용량의 상한을 둔다. 디스크가 로그로 가득 차는 상황을 애초에 막을 수 있다.
+
+설정이 서비스의 yml과 코드에 들어 있어서 **버전 관리가 되고, 환경별로 일관되게 배포**할 수 있다는 점도 장점이었다.
+
+---
+
+## logrotate vs Logback 비교
+
+| 항목 | logrotate | Logback 롤링 |
+| --- | --- | --- |
+| 관리 주체 | OS (cron) | 애플리케이션 프로세스 |
+| 적용 범위 | 서버 전체 로그 | 해당 서비스 로그 |
+| 파일 핸들 문제 | 있음 (copytruncate로 우회, 불완전) | 없음 |
+| 설정 위치 | 서버 (`/etc/logrotate.d`) | 서비스 코드/yml |
+| 버전 관리 | 서버마다 따로 관리 필요 | 서비스와 함께 관리 |
+| 어울리는 대상 | 시스템 로그, 비-Java 로그 | Java 애플리케이션 로그 |
+
+---
+
+## 적용
+
+4개 서비스에 Logback 롤링 정책을 적용했고,
+환경별로 **개발 → 수요 → 운영** 순서로 단계적으로 배포해 위험을 줄였다.
+환경별 설정은 yml로 분리해 외부에서 관리하게 했다.
+
+---
+
+## 정리
+
+`logrotate`와 Logback 중 하나가 무조건 낫다기보다는 **로그를 쓰는 주체가 누구냐**에 따라 갈린다고 정리했다.
+
+- 애플리케이션이 직접 쓰는 로그 → 그 프로세스가 롤링하는 **Logback**
+- 시스템 로그나 애플리케이션 밖의 로그 → 서버 전체를 관리하는 **logrotate**
+
+처음에 세운 계획을 그대로 밀고 가지 않고,
+파일 핸들 문제라는 구체적인 이유로 방향을 바꿀 수 있었던 논의였다.

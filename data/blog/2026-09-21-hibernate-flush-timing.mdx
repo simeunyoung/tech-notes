@@ -1,0 +1,112 @@
+---
+title: 'JPA 저장 순서 때문에 FK 위반과 Duplicate key가 났던 문제 — flush 타이밍'
+date: '2026-09-21'
+draft: false
+summary: '같은 트랜잭션 안에서 UPDATE 직후 그 값을 참조하는 INSERT, DELETE 직후 같은 키의 INSERT를 실행하다 발생한 FK 위반과 Duplicate key 오류의 원인을 Hibernate의 쓰기 지연과 flush 순서로 분석하고 명시적 flush로 해결한 과정을 정리한다.'
+tags: ['spring-boot', 'backend', 'troubleshooting']
+---
+
+## 상황
+
+디바이스 등록 흐름을 MQTT 상시구독 방식으로 새로 구현하고 테스트하다가 DB 오류가 두 건 났다.
+같은 트랜잭션 안에서 실행되는 로직이었다.
+등록 흐름을 다시 설계한 과정은 아래 글에 정리했다.
+
+👉 [디바이스 등록을 HTTP 임시구독에서 MQTT 상시구독으로 재설계하기](/blog/2026-09-20-mqtt-persistent-subscribe)
+
+**1. FK 위반**
+디바이스의 임시 식별자를 정식 식별자로 UPDATE한 직후,
+정식 식별자를 FK로 참조하는 행을 INSERT했더니 FK 위반이 났다.
+
+**2. Duplicate key**
+재등록 시 기존 상태 데이터를 DELETE한 직후
+같은 `디바이스 ID + 리소스 URI` 조합으로 다시 INSERT했더니 UNIQUE 제약 위반이 났다.
+
+코드 순서상으로는 둘 다 문제가 없어 보였다.
+UPDATE가 먼저 실행됐으니 FK가 맞아야 하고, DELETE가 먼저 실행됐으니 키가 비어 있어야 한다.
+
+---
+
+## 원인 — Hibernate는 SQL을 바로 보내지 않는다
+
+Hibernate는 `save()`나 `delete()`를 호출해도 SQL을 바로 DB로 보내지 않는다.
+내부 대기열(ActionQueue)에 쌓아두었다가 아래 시점에 한꺼번에 보낸다.
+
+1. 트랜잭션 commit 시점
+2. SELECT 쿼리를 실행하기 직전 (AUTO flush)
+
+그리고 대기열의 SQL은 **호출한 순서대로 나가지 않는다.**
+flush가 일어나면 Hibernate는 종류별로 정해진 순서(INSERT → UPDATE → DELETE)로 SQL을 실행한다.
+
+```
+코드 순서                      실제 DB로 나가는 순서
+1. UPDATE (식별자 변경)         1. INSERT (FK로 참조하는 행)   ← 아직 UPDATE 전
+2. INSERT (FK 참조 행)          2. UPDATE (식별자 변경)
+
+1. DELETE (기존 상태 삭제)      1. INSERT (같은 키로 삽입)     ← 아직 DELETE 전
+2. INSERT (같은 키로 삽입)      2. DELETE (기존 상태 삭제)
+```
+
+첫 번째 경우에는 UPDATE가 대기열에만 있고 DB에는 예전 식별자가 남아 있는 상태에서
+새 식별자를 FK로 참조하는 INSERT가 나가서 FK 위반이 났다.
+두 번째 경우에는 DELETE가 아직 실행되지 않아 기존 행이 살아 있는 상태에서
+같은 키의 INSERT가 나가서 UNIQUE 제약에 걸렸다.
+
+---
+
+## 기존 흐름에서는 왜 문제가 없었나
+
+이 부분을 먼저 확인했다.
+기존 HTTP 기반 등록 흐름에서는 같은 순서로 쓰기를 해도 오류가 없었다.
+
+차이는 **중간에 SELECT가 있었다**는 점이었다.
+기존 흐름은 UPDATE 다음에 검증 로직이 DB를 조회했고,
+Hibernate는 SELECT 실행 전에 대기열을 flush하기 때문에 UPDATE와 DELETE가 자동으로 먼저 반영됐다.
+
+새로 만든 흐름은 검증이 다른 방식이라 쓰기 사이에 SELECT가 없었다.
+`save()`만 연속으로 호출되니 AUTO flush가 일어날 계기가 없었고,
+그동안은 우연히 SELECT가 flush를 대신 해주고 있었던 셈이다.
+
+---
+
+## 해결 — 명시적 flush
+
+쓰기 결과에 다음 쓰기가 의존하는 두 지점에 `entityManager.flush()`를 넣었다.
+
+```java
+// 1. 식별자 변경 후, 그 식별자를 참조하는 INSERT 전
+deviceRepository.save(device);          // UPDATE
+entityManager.flush();                  // 여기서 DB에 반영
+firmwareRepository.save(newFirmware);   // FK로 참조하는 INSERT
+
+// 2. 기존 데이터 삭제 후, 같은 키로 INSERT 전
+deleteDevice(deviceId);                 // DELETE
+entityManager.flush();                  // 여기서 DB에 반영
+saveCurrentStatus(deviceId, payload);   // 같은 키로 INSERT
+```
+
+---
+
+## flush는 commit이 아니다
+
+flush를 넣으면서 걱정한 건 트랜잭션 원자성이었다.
+중간에 DB로 SQL을 보내버리면 롤백이 안 되는 게 아닌가 하는 것이다.
+
+`flush()`는 대기열의 SQL을 DB로 **보낼 뿐** 트랜잭션은 계속 열려 있다.
+flush 이후에 예외가 나면 앞서 보낸 SQL도 함께 rollback된다.
+그래서 명시적 flush를 넣어도 원자성은 그대로 유지된다.
+
+| | flush | commit |
+| --- | --- | --- |
+| SQL을 DB로 전송 | O | O |
+| 트랜잭션 종료 | X | O |
+| 이후 예외 시 rollback | 가능 | 불가 |
+
+---
+
+## 정리
+
+- Hibernate의 쓰기는 **지연되고, 호출 순서가 아니라 종류별 순서**로 실행된다.
+- 같은 트랜잭션 안에서 **쓰기 결과에 다음 쓰기가 의존하는데 중간에 SELECT가 없다면**, 명시적 `flush()`가 필요하다.
+- 기존 코드가 문제없이 동작했던 이유가 "우연히 끼어 있던 SELECT" 때문일 수 있다.
+  로직을 옮기거나 새로 만들 때 이런 암묵적인 전제가 사라질 수 있다.
