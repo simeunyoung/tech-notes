@@ -1,0 +1,107 @@
+---
+title: 'EC2 IAM Role을 컨테이너에서 쓰기 전에 확인해야 할 것 — IMDSv2 홉 제한'
+date: '2026-09-21'
+draft: false
+summary: 'IMDSv2를 강제한 EC2에서 Docker 브리지 네트워크의 컨테이너가 메타데이터 서비스에 접근할 때 홉이 하나 늘어난다는 걸 확인하고, 실패가 나기 전에 홉 제한을 미리 올려 대응한 과정을 정리한다.'
+tags: ['infra', 'devops']
+---
+
+## 배경
+
+새 서비스가 파일을 S3에 올려야 해서, 접근 권한은 별도 액세스 키 없이 **EC2에 붙어 있는 IAM Role**로 주기로 했다.
+서비스는 Docker 컨테이너로 돌고 있었다.
+
+권한 쪽은 기존 EC2 공용 Role이 이미 충분해서 새 Role을 만들지 않았다.
+그런데 이 Role의 자격증명을 컨테이너 안에서 실제로 가져올 수 있는지는 별개의 문제였다.
+EC2 인스턴스가 이미 IMDSv2를 강제하고 있었기 때문이다.
+
+```bash
+aws ec2 describe-instances --instance-ids <인스턴스 ID> \
+  --query 'Reservations[].Instances[].MetadataOptions'
+```
+
+`HttpTokens: required`로 설정되어 있었다. 컨테이너에서 자격증명을 못 읽는 사고가 나기 전에, 이 조합이 실제로 안전한지 먼저 확인하기로 했다.
+
+---
+
+## IMDSv2 동작 확인
+
+IMDSv2는 메타데이터를 읽기 전에 토큰을 먼저 받아야 하는 방식이다.
+
+```bash
+# 1. 토큰 발급 (PUT)
+TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+
+# 2. 토큰으로 Role 이름 조회
+curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/iam/security-credentials/
+```
+
+EC2 호스트에서 직접 실행하면 문제없이 동작한다.
+하지만 이 서비스는 호스트가 아니라 **Docker 브리지 네트워크의 컨테이너 안**에서 이 요청을 보내야 했다.
+
+---
+
+## 원인이 될 수 있는 지점 — 홉 제한
+
+IMDSv2의 토큰 응답 패킷에는 기본적으로 **홉 제한(hop limit)이 1**로 걸려 있다.
+응답이 EC2 인스턴스를 벗어나 한 번 이상 전달되지 못하게 막는 설정이다.
+
+Docker의 기본 **브리지 네트워크**는 컨테이너와 호스트 사이에 가상 네트워크 계층을 하나 더 둔다.
+그래서 컨테이너가 메타데이터 서비스에 요청을 보내면 응답이 호스트를 거쳐 컨테이너까지 한 홉 더 건너야 한다.
+
+```
+호스트에서 호출         인스턴스 → 메타데이터 서비스              (홉 1)
+브리지 컨테이너에서 호출  컨테이너 → 호스트 → 메타데이터 서비스    (홉 2)
+```
+
+홉 제한이 1인 채로 두면, 컨테이너 쪽 요청은 두 번째 홉에서 패킷이 버려져 응답을 받지 못할 수 있다.
+`host` 네트워크 모드로 띄우면 컨테이너가 호스트의 네트워크를 그대로 쓰기 때문에 이 문제가 없다.
+이 서비스는 브리지 모드였고, 아직 실제로 요청이 막히는 걸 보진 않았지만 구조상 걸릴 수 있는 지점이라고 판단했다.
+
+---
+
+## 실패를 겪기 전에 홉 제한을 올림
+
+문제가 실제로 터지고 나서 고치기보다, 동작 원리를 확인한 시점에 미리 값을 올려두기로 했다.
+
+```bash
+aws ec2 modify-instance-metadata-options \
+  --instance-id <인스턴스 ID> \
+  --http-put-response-hop-limit 2 \
+  --http-tokens required \
+  --http-endpoint enabled
+```
+
+IMDSv2 강제(`HttpTokens: required`)는 그대로 유지했다.
+보안 설정을 낮춰서 우회한 게 아니라, 컨테이너가 한 홉 더 건널 수 있게만 여유를 준 것이다.
+
+---
+
+## 컨테이너 안에서 직접 확인
+
+설정만 바꾸고 끝내지 않고, 실제 컨테이너 안에서 같은 순서로 확인했다.
+
+```bash
+docker exec -it <컨테이너> sh
+
+# 토큰 발급 → Role 이름 조회
+TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/iam/security-credentials/
+```
+
+Role 이름이 정상적으로 반환됐다.
+컨테이너 안에서 자격증명을 읽을 수 있다는 것을 미리 확인했고, S3 접근도 문제없다고 판단했다.
+
+다른 환경의 인스턴스에도 같은 설정이 필요해서 작업 문서에 적어뒀다.
+
+---
+
+## 정리
+
+- IMDSv2를 강제한 EC2에서 Docker 브리지 네트워크를 쓰면, 컨테이너의 메타데이터 요청은 호스트를 한 번 더 거쳐 **홉이 하나 늘어난다.** 기본 홉 제한 1로는 부족할 수 있는 구조다.
+- 실패가 나길 기다리지 않고, 이 구조를 확인한 시점에 홉 제한을 2로 올려뒀다. IMDSv2 강제는 그대로 유지했다.
+- 설정을 바꾼 뒤에는 EC2 호스트가 아니라 **컨테이너 안에서** 같은 순서로 검증했다.
